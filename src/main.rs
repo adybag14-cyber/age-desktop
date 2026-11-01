@@ -12,6 +12,7 @@ pub struct Options {
     pub probe: Option<PathBuf>,
     pub files: Vec<PathBuf>,
     pub dark: bool,
+    pub page: String,
 }
 
 fn main() -> iced::Result {
@@ -22,6 +23,7 @@ fn main() -> iced::Result {
         probe: None,
         files: Vec::new(),
         dark: false,
+        page: "encrypt".into(),
     };
     let mut args = std::env::args_os().skip(1);
     while let Some(argument) = args.next() {
@@ -35,6 +37,15 @@ fn main() -> iced::Result {
             }
             Some("--probe") => options.probe = args.next().map(PathBuf::from),
             Some("--dark") => options.dark = true,
+            Some("--page") => {
+                options.page = args
+                    .next()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            }
+            Some("--decrypt" | "-d") => options.page = "decrypt".into(),
+            Some("--encrypt" | "-e") => options.page = "encrypt".into(),
             Some("--") => {
                 options.files.extend(args.map(PathBuf::from));
                 break;
@@ -58,7 +69,10 @@ fn main() -> iced::Result {
         ui::App::update,
         ui::App::view,
     )
-    .title("age — file encryption")
+    .title(concat!(
+        "age — file encryption · ",
+        env!("CARGO_PKG_VERSION")
+    ))
     .theme(ui::App::theme)
     .subscription(ui::App::subscription)
     .window(iced::window::Settings {

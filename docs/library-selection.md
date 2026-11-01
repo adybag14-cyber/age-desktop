@@ -23,4 +23,4 @@ Primary sources:
 - [age reference implementation](https://github.com/FiloSottile/age)
 - [Rust age library](https://docs.rs/age/0.11.5/age/)
 
-The GUI uses the Rust library directly. The official Go executable is downloaded only as a test oracle and is not part of the application.
+Version 0.1 used the Rust age library directly. Version 0.2 keeps the UI and file/process orchestration in Rust and uses a lazy local adapter around the official Go age 1.3.2 library for full current recipient and plugin compatibility. The engine never starts on an ordinary empty GUI launch. See cli-parity.md for the supported workflows.

@@ -1,367 +1,482 @@
-use age::secrecy::{ExposeSecret, SecretString};
-use age_desktop::crypto::{self, Credential, Job, Operation, Progress};
+use age_desktop::{
+    crypto::{self, Job, Operation},
+    engine::{self, Progress, Request, Response},
+};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
-fn execute(
-    input: &Path,
-    output: &Path,
-    operation: Operation,
-    armor: bool,
-    credential: Credential,
-) -> Vec<crypto::FileResult> {
-    crypto::run(
-        Job {
-            inputs: vec![input.to_owned()],
-            output_dir: Some(output.to_owned()),
-            operation,
-            armor,
-            credential,
-        },
-        Arc::new(Progress::default()),
-    )
+fn key(dir: &Path, kind: &str, protected: bool) -> (PathBuf, String) {
+    let path = dir.join(format!(
+        "{kind}-{}.agekey",
+        if protected { "protected" } else { "plain" }
+    ));
+    let mut r = Request::new("generate_key");
+    r.key_kind = kind.into();
+    r.protect_key = protected;
+    r.passphrase = "fixture-only meadow lantern comet river".into();
+    let result = crypto::generate_identity(&path, r, Arc::new(Progress::default())).unwrap();
+    (path, result.public_keys[0].clone())
 }
-
-fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, String) {
-    let dir = tempfile::tempdir().unwrap();
-    let input = dir.path().join("notes-世界.txt");
-    // Cross multiple authenticated age chunks, including a final partial chunk.
+fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let d = tempfile::tempdir().unwrap();
+    let input = d.path().join("notes-世界.bin");
     fs::write(
         &input,
-        (0..200_123).map(|i| (i % 251) as u8).collect::<Vec<_>>(),
+        (0..200123).map(|i| (i % 251) as u8).collect::<Vec<_>>(),
     )
     .unwrap();
-    let output = dir.path().join("output");
+    let output = d.path().join("output");
     fs::create_dir(&output).unwrap();
-    let identity = dir.path().join("identity.agekey");
-    let public = crypto::generate_identity(&identity).unwrap();
-    (dir, input, output, identity, public)
+    (d, input, output)
 }
-
-#[test]
-fn native_keys_binary_and_armor_roundtrip_multiple_chunks() {
-    let (dir, input, output, identity, public) = fixture();
-    for armor in [false, true] {
-        let result = execute(
-            &input,
-            dir.path(),
-            Operation::Encrypt,
-            armor,
-            Credential::Recipients(public.clone()),
-        );
-        let encrypted = result[0].output.as_ref().expect("encrypted file");
-        assert_ne!(fs::read(&input).unwrap(), fs::read(encrypted).unwrap());
-        let restored_dir = output.join(if armor { "armor" } else { "binary" });
-        fs::create_dir(&restored_dir).unwrap();
-        let result = execute(
-            encrypted,
-            &restored_dir,
-            Operation::Decrypt,
-            false,
-            Credential::IdentityFile(identity.clone()),
-        );
-        assert_eq!(
-            fs::read(result[0].output.as_ref().unwrap()).unwrap(),
-            fs::read(&input).unwrap()
-        );
+fn job(input: &Path, out: &Path, operation: Operation, request: Request) -> Job {
+    Job {
+        operation,
+        inputs: vec![input.to_owned()],
+        output_dir: Some(out.to_owned()),
+        output_file: None,
+        overwrite: false,
+        request,
     }
 }
-
-#[test]
-fn multiple_recipients_can_each_decrypt() {
-    let (dir, input, output, first, public) = fixture();
-    let second = dir.path().join("second.agekey");
-    let second_public = crypto::generate_identity(&second).unwrap();
-    let recipients = format!("# my team\n{public}\n\n{second_public}\n");
-    let encrypted = execute(
-        &input,
-        dir.path(),
-        Operation::Encrypt,
-        false,
-        Credential::Recipients(recipients),
-    )[0]
-    .output
-    .clone()
-    .unwrap();
-    for (i, key) in [first, second].into_iter().enumerate() {
-        let target = output.join(i.to_string());
-        fs::create_dir(&target).unwrap();
-        let result = execute(
-            &encrypted,
-            &target,
-            Operation::Decrypt,
-            false,
-            Credential::IdentityFile(key),
-        );
-        assert_eq!(
-            fs::read(result[0].output.as_ref().unwrap()).unwrap(),
-            fs::read(&input).unwrap()
-        );
-    }
+fn enc(public: &str, armor: bool) -> Request {
+    let mut r = Request::new("encrypt");
+    r.recipients = public.into();
+    r.armor = armor;
+    r
 }
-
-#[test]
-fn passphrase_roundtrip_and_wrong_passphrase_never_leaves_plaintext() {
-    let (dir, input, output, _, _) = fixture();
-    let secret = || {
-        Credential::Passphrase(SecretString::from(
-            "test-only amber meadow winter orbit".to_owned(),
-        ))
+fn dec(identity: &Path) -> Request {
+    let mut r = Request::new("decrypt");
+    r.identity_files = vec![identity.to_str().unwrap().into()];
+    r
+}
+fn run(job: Job) -> Vec<crypto::FileResult> {
+    crypto::run(job, Arc::new(Progress::default()))
+}
+fn with_replies<T>(f: impl FnOnce(Arc<Progress>) -> T) -> T {
+    let p = Arc::new(Progress::default());
+    let done = Arc::new(AtomicBool::new(false));
+    let responder = {
+        let p = p.clone();
+        let done = done.clone();
+        thread::spawn(move || {
+            let mut last = 0;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !done.load(Ordering::Acquire) {
+                if Instant::now() > deadline {
+                    p.cancel();
+                    break;
+                }
+                let prompt = p.prompt.lock().unwrap().clone();
+                if let Some(prompt) = prompt
+                    && prompt.id != last
+                {
+                    last = prompt.id;
+                    let value = if !prompt.yes.is_empty() {
+                        "yes"
+                    } else if prompt.message.contains("Test PIN") {
+                        "fixture-pin"
+                    } else {
+                        "fixture-only meadow lantern comet river"
+                    };
+                    p.respond(prompt.id, value.into(), false);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        })
     };
-    let encrypted = execute(&input, dir.path(), Operation::Encrypt, true, secret())[0]
+    let result = f(p);
+    done.store(true, Ordering::Release);
+    responder.join().unwrap();
+    result
+}
+fn success(result: &[crypto::FileResult]) -> PathBuf {
+    result[0]
         .output
         .clone()
-        .unwrap();
-    let wrong = execute(
-        &encrypted,
-        &output,
-        Operation::Decrypt,
-        false,
-        Credential::Passphrase(SecretString::from("incorrect".to_owned())),
-    );
-    assert!(wrong[0].error.is_some());
-    assert_eq!(fs::read_dir(&output).unwrap().count(), 0);
-    let restored = execute(&encrypted, &output, Operation::Decrypt, false, secret());
-    assert_eq!(
-        fs::read(restored[0].output.as_ref().unwrap()).unwrap(),
-        fs::read(&input).unwrap()
-    );
+        .unwrap_or_else(|| panic!("operation failed: {:?}", result[0].error))
 }
 
 #[test]
-fn corruption_truncation_and_wrong_identity_leave_no_output_or_temporary_file() {
-    let (dir, input, output, identity, public) = fixture();
-    let encrypted = execute(
-        &input,
-        dir.path(),
-        Operation::Encrypt,
-        false,
-        Credential::Recipients(public),
-    )[0]
-    .output
-    .clone()
-    .unwrap();
-    let original = fs::read(&encrypted).unwrap();
-    let other = dir.path().join("other.agekey");
-    crypto::generate_identity(&other).unwrap();
-    let result = execute(
-        &encrypted,
-        &output,
-        Operation::Decrypt,
-        false,
-        Credential::IdentityFile(other),
-    );
-    assert!(result[0].error.is_some());
-    assert_eq!(fs::read_dir(&output).unwrap().count(), 0);
-    for truncate in [false, true] {
-        let mut corrupt = original.clone();
-        if truncate {
-            corrupt.truncate(corrupt.len() - 5);
-        } else {
-            let last = corrupt.len() - 1;
-            corrupt[last] ^= 1;
+fn official_engine_reports_pinned_version() {
+    let r = crypto::confirm_engine().unwrap();
+    assert!(r.engine.contains("age 1.3.2"));
+    assert!(r.go.starts_with("go1.27"));
+}
+
+#[test]
+fn classic_and_quantum_binary_and_armor_multichunk_roundtrips() {
+    for kind in ["classic", "pq"] {
+        let (d, input, out) = fixture();
+        let (id, pubkey) = key(d.path(), kind, false);
+        for armor in [false, true] {
+            let target = out.join(if armor { "armor" } else { "binary" });
+            fs::create_dir(&target).unwrap();
+            let encrypted = success(&run(job(
+                &input,
+                &target,
+                Operation::Encrypt,
+                enc(&pubkey, armor),
+            )));
+            let restored = success(&run(job(&encrypted, &out, Operation::Decrypt, dec(&id))));
+            assert!(crypto::same_contents(&input, &restored).unwrap());
+            fs::remove_file(restored).unwrap();
         }
-        fs::write(&encrypted, corrupt).unwrap();
-        let result = execute(
-            &encrypted,
-            &output,
-            Operation::Decrypt,
-            false,
-            Credential::IdentityFile(identity.clone()),
-        );
-        assert!(result[0].error.is_some());
-        assert_eq!(fs::read_dir(&output).unwrap().count(), 0);
     }
 }
 
 #[test]
-fn output_collisions_preserve_original_and_existing_ciphertext() {
-    let (dir, input, _, identity, public) = fixture();
-    let original = fs::read(&input).unwrap();
-    let encrypted = execute(
+fn protected_quantum_identity_prompts_over_private_pipe() {
+    let (d, input, out) = fixture();
+    let (id, pubkey) = key(d.path(), "pq", true);
+    let encrypted = success(&run(job(
         &input,
-        dir.path(),
+        d.path(),
         Operation::Encrypt,
-        false,
-        Credential::Recipients(public.clone()),
-    )[0]
-    .output
-    .clone()
-    .unwrap();
-    let ciphertext = fs::read(&encrypted).unwrap();
-    let second = execute(
-        &input,
-        dir.path(),
-        Operation::Encrypt,
-        false,
-        Credential::Recipients(public),
-    );
-    assert!(second[0].error.is_some());
-    assert_eq!(fs::read(&encrypted).unwrap(), ciphertext);
-    let decrypt = execute(
-        &encrypted,
-        dir.path(),
-        Operation::Decrypt,
-        false,
-        Credential::IdentityFile(identity),
-    );
-    assert!(decrypt[0].error.is_some());
-    assert_eq!(fs::read(&input).unwrap(), original);
+        enc(&pubkey, true),
+    )));
+    let result =
+        with_replies(|p| crypto::run(job(&encrypted, &out, Operation::Decrypt, dec(&id)), p));
+    assert!(crypto::same_contents(&input, &success(&result)).unwrap());
+    let mut export = Request::new("public_keys");
+    export.identity_files.push(id.to_str().unwrap().into());
+    let result = with_replies(|p| engine::run(&export, p)).unwrap();
+    assert_eq!(result.public_keys, vec![pubkey]);
 }
 
 #[test]
-fn cancelled_job_creates_nothing() {
-    let (dir, input, output, _, public) = fixture();
-    let progress = Arc::new(Progress::default());
-    progress.cancelled.store(true, Ordering::Relaxed);
-    let result = crypto::run(
-        Job {
-            inputs: vec![input],
-            output_dir: Some(output.clone()),
-            operation: Operation::Encrypt,
-            armor: false,
-            credential: Credential::Recipients(public),
-        },
-        progress,
-    );
-    assert!(result[0].error.as_ref().unwrap().contains("Cancelled"));
-    assert_eq!(fs::read_dir(output).unwrap().count(), 0);
-    drop(dir);
-}
-
-#[test]
-fn key_creation_is_parseable_and_never_replaces_a_key() {
-    let (dir, _, _, identity, public) = fixture();
-    let original = fs::read(&identity).unwrap();
-    assert_eq!(crypto::inspect_identity(&identity).unwrap(), vec![public]);
-    assert!(crypto::generate_identity(&identity).is_err());
-    assert_eq!(fs::read(&identity).unwrap(), original);
-    let invalid = dir.path().join("invalid-key");
-    fs::write(&invalid, "AGE-SECRET-KEY-invalid-test-value").unwrap();
-    let error = crypto::inspect_identity(&invalid).unwrap_err();
-    assert!(!error.contains("invalid-test-value"));
-}
-
-#[test]
-fn batch_reports_each_failure_and_keeps_successful_outputs() {
-    let (dir, input, output, _, public) = fixture();
-    let result = crypto::run(
-        Job {
-            inputs: vec![dir.path().join("missing"), input],
-            output_dir: Some(output),
-            operation: Operation::Encrypt,
-            armor: false,
-            credential: Credential::Recipients(public),
-        },
-        Arc::new(Progress::default()),
-    );
-    assert!(result[0].error.is_some());
-    assert!(result[1].output.as_ref().unwrap().is_file());
-}
-
-#[test]
-fn empty_file_roundtrips_and_invalid_recipient_is_rejected() {
-    let (dir, input, output, identity, public) = fixture();
-    fs::write(&input, []).unwrap();
-    let invalid = execute(
-        &input,
-        &output,
-        Operation::Encrypt,
-        false,
-        Credential::Recipients("not-a-public-key".into()),
-    );
-    assert!(invalid[0].error.is_some());
-    assert_eq!(fs::read_dir(&output).unwrap().count(), 0);
-    let encrypted = execute(
-        &input,
-        dir.path(),
-        Operation::Encrypt,
-        false,
-        Credential::Recipients(public),
-    )[0]
-    .output
-    .clone()
-    .unwrap();
-    let decrypted = execute(
-        &encrypted,
-        &output,
-        Operation::Decrypt,
-        false,
-        Credential::IdentityFile(identity),
-    );
-    assert_eq!(
-        fs::metadata(decrypted[0].output.as_ref().unwrap())
-            .unwrap()
-            .len(),
-        0
-    );
-}
-
-#[test]
-#[ignore = "requires official Go age executable in AGE_REFERENCE_BIN"]
-fn official_go_age_interoperability_both_directions() {
-    let age = std::env::var_os("AGE_REFERENCE_BIN").expect("set AGE_REFERENCE_BIN");
-    let (dir, input, output, identity, public) = fixture();
-    for armor in [false, true] {
-        let encrypted = execute(
+fn recipients_files_multiple_identities_and_self_encryption() {
+    let (d, input, out) = fixture();
+    let (id, public) = key(d.path(), "classic", false);
+    let otherdir = d.path().join("other");
+    fs::create_dir(&otherdir).unwrap();
+    let (wrong, _) = key(&otherdir, "classic", false);
+    let recipients = d.path().join("recipients.txt");
+    fs::write(&recipients, format!("# self\n{public}\n")).unwrap();
+    let mut r = Request::new("encrypt");
+    r.recipient_files.push(recipients.to_str().unwrap().into());
+    let encrypted = success(&run(job(&input, d.path(), Operation::Encrypt, r)));
+    let mut r = dec(&wrong);
+    r.identity_files.push(id.to_str().unwrap().into());
+    assert!(
+        crypto::same_contents(
             &input,
-            dir.path(),
-            Operation::Encrypt,
-            armor,
-            Credential::Recipients(public.clone()),
-        )[0]
-        .output
-        .clone()
-        .unwrap();
-        let go_restored = output.join(format!("go-{armor}.txt"));
-        let result = std::process::Command::new(&age)
-            .arg("--decrypt")
-            .arg("--identity")
-            .arg(&identity)
-            .arg("--output")
-            .arg(&go_restored)
-            .arg(&encrypted)
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "reference age rejected desktop ciphertext"
-        );
-        assert_eq!(fs::read(go_restored).unwrap(), fs::read(&input).unwrap());
-        let go_encrypted = dir.path().join(format!("from-go-{armor}.age"));
-        let mut command = std::process::Command::new(&age);
-        command
-            .arg("--encrypt")
-            .arg("--recipient")
-            .arg(&public)
-            .arg("--output")
-            .arg(&go_encrypted);
-        if armor {
-            command.arg("--armor");
-        }
-        let result = command.arg(&input).output().unwrap();
-        assert!(result.status.success());
-        let restored = execute(
-            &go_encrypted,
-            &output,
-            Operation::Decrypt,
-            false,
-            Credential::IdentityFile(identity.clone()),
-        );
-        assert_eq!(
-            fs::read(restored[0].output.as_ref().unwrap()).unwrap(),
-            fs::read(&input).unwrap()
-        );
-    }
-    // Validate an independently generated identity as well, without exposing it.
-    let generated = age::x25519::Identity::generate();
-    let p = dir.path().join("independent.agekey");
-    fs::write(&p, generated.to_string().expose_secret()).unwrap();
-    assert_eq!(
-        crypto::inspect_identity(&p).unwrap(),
-        vec![generated.to_public().to_string()]
+            &success(&run(job(&encrypted, &out, Operation::Decrypt, r)))
+        )
+        .unwrap()
     );
+    let mut r = Request::new("encrypt");
+    r.identity_files.push(id.to_str().unwrap().into());
+    r.text = Some("encrypt to myself".into());
+    let ciphertext = engine::run(&r, Arc::new(Progress::default())).unwrap();
+    let mut r = dec(&id);
+    r.text = ciphertext.text.clone();
+    assert_eq!(
+        engine::run(&r, Arc::new(Progress::default()))
+            .unwrap()
+            .text
+            .as_deref(),
+        Some("encrypt to myself")
+    );
+}
+
+#[test]
+fn passphrase_text_roundtrip_and_automatic_prompt() {
+    let mut r = Request::new("encrypt");
+    r.protection = "passphrase".into();
+    r.passphrase = "fixture-only meadow lantern comet river".into();
+    r.text = Some("A private note ✓".into());
+    let encrypted = engine::run(&r, Arc::new(Progress::default())).unwrap();
+    let mut r = Request::new("decrypt");
+    r.text = encrypted.text.clone();
+    let result = with_replies(|p| engine::run(&r, p)).unwrap();
+    assert_eq!(result.text.as_deref(), Some("A private note ✓"));
+    r.passphrase = "wrong".into();
+    assert!(engine::run(&r, Arc::new(Progress::default())).is_err());
+}
+
+#[test]
+fn wrong_key_corruption_and_truncation_preserve_existing_output() {
+    let (d, input, out) = fixture();
+    let (id, public) = key(d.path(), "classic", false);
+    let encrypted = success(&run(job(
+        &input,
+        d.path(),
+        Operation::Encrypt,
+        enc(&public, false),
+    )));
+    let original = fs::read(&encrypted).unwrap();
+    let target = out.join(input.file_name().unwrap());
+    fs::write(&target, b"preserve this output").unwrap();
+    let other = d.path().join("other");
+    fs::create_dir(&other).unwrap();
+    let (wrong, _) = key(&other, "classic", false);
+    let mut request = job(&encrypted, &out, Operation::Decrypt, dec(&wrong));
+    request.overwrite = true;
+    assert!(run(request)[0].error.is_some());
+    for truncate in [false, true] {
+        let mut bad = original.clone();
+        if truncate {
+            bad.truncate(bad.len() - 7);
+        } else {
+            let end = bad.len() - 1;
+            bad[end] ^= 1;
+        }
+        fs::write(&encrypted, bad).unwrap();
+        let mut request = job(&encrypted, &out, Operation::Decrypt, dec(&id));
+        request.overwrite = true;
+        assert!(run(request)[0].error.is_some());
+        assert_eq!(fs::read(&target).unwrap(), b"preserve this output");
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn explicit_output_and_overwrite_never_replace_sources_or_keys() {
+    let (d, input, out) = fixture();
+    let (id, public) = key(d.path(), "classic", false);
+    let mut request = job(&input, &out, Operation::Encrypt, enc(&public, false));
+    let named = out.join("custom-name.age");
+    request.output_file = Some(named.clone());
+    let encrypted = success(&run(request));
+    assert_eq!(encrypted, named);
+    let first = fs::read(&named).unwrap();
+    let mut repeat = job(&input, &out, Operation::Encrypt, enc(&public, false));
+    repeat.output_file = Some(named.clone());
+    assert!(run(repeat)[0].error.is_some());
+    assert_eq!(fs::read(&named).unwrap(), first);
+    let mut replace = job(&input, &out, Operation::Encrypt, enc(&public, false));
+    replace.output_file = Some(named.clone());
+    replace.overwrite = true;
+    success(&run(replace));
+    assert_ne!(fs::read(&named).unwrap(), first);
+    for target in [&input, &id] {
+        let original = fs::read(target).unwrap();
+        let mut unsafe_job = job(&input, &out, Operation::Encrypt, enc(&public, false));
+        unsafe_job
+            .request
+            .identity_files
+            .push(id.to_str().unwrap().into());
+        unsafe_job.output_file = Some(target.clone());
+        unsafe_job.overwrite = true;
+        assert!(run(unsafe_job)[0].error.is_some());
+        assert_eq!(fs::read(target).unwrap(), original);
+    }
+}
+
+#[test]
+fn hard_link_output_cannot_replace_source() {
+    let (d, input, out) = fixture();
+    let (_, public) = key(d.path(), "classic", false);
+    let linked = out.join("linked-output");
+    fs::hard_link(&input, &linked).unwrap();
+    let mut request = job(&input, &out, Operation::Encrypt, enc(&public, false));
+    request.output_file = Some(linked);
+    request.overwrite = true;
+    assert!(run(request)[0].error.is_some());
+}
+
+#[test]
+fn cancel_waiting_for_password_cleans_temp_file() {
+    let (d, input, out) = fixture();
+    let mut r = Request::new("encrypt");
+    r.protection = "passphrase".into();
+    r.passphrase = "fixture-only meadow lantern comet river".into();
+    let encrypted = success(&run(job(&input, d.path(), Operation::Encrypt, r)));
+    let p = Arc::new(Progress::default());
+    let worker = {
+        let p = p.clone();
+        let out = out.clone();
+        thread::spawn(move || {
+            crypto::run(
+                job(
+                    &encrypted,
+                    &out,
+                    Operation::Decrypt,
+                    Request::new("decrypt"),
+                ),
+                p,
+            )
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while p.prompt.lock().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "password prompt did not arrive");
+        thread::sleep(Duration::from_millis(10));
+    }
+    p.cancel();
+    assert!(
+        worker.join().unwrap()[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Cancelled")
+    );
+    assert_eq!(fs::read_dir(out).unwrap().count(), 0);
+}
+
+#[test]
+fn key_creation_never_overwrites_and_private_key_is_not_returned() {
+    let (d, _, _) = fixture();
+    let (path, public) = key(d.path(), "pq", false);
+    let original = fs::read(&path).unwrap();
+    let r = Request::new("generate_key");
+    assert!(crypto::generate_identity(&path, r, Arc::new(Progress::default())).is_err());
+    assert_eq!(fs::read(path).unwrap(), original);
+    assert!(public.starts_with("age1pq1"));
+    assert!(!public.contains("SECRET"));
+}
+
+#[test]
+fn empty_files_and_partial_batch_results() {
+    let (d, input, out) = fixture();
+    fs::write(&input, []).unwrap();
+    let (id, public) = key(d.path(), "classic", false);
+    let mut batch = job(&input, &out, Operation::Encrypt, enc(&public, false));
+    batch.inputs.insert(0, d.path().join("missing"));
+    let result = run(batch);
+    assert!(result[0].error.is_some());
+    let encrypted = result[1].output.as_ref().unwrap();
+    let restored = success(&run(job(encrypted, &out, Operation::Decrypt, dec(&id))));
+    assert_eq!(fs::metadata(restored).unwrap().len(), 0);
+}
+
+#[test]
+fn inspection_returns_metadata_without_plaintext() {
+    let (d, input, _) = fixture();
+    fs::write(&input, "distinct private payload marker").unwrap();
+    let (_, public) = key(d.path(), "pq", false);
+    let encrypted = success(&run(job(
+        &input,
+        d.path(),
+        Operation::Encrypt,
+        enc(&public, false),
+    )));
+    let mut r = Request::new("inspect");
+    r.input = encrypted.to_str().unwrap().into();
+    let result = engine::run(&r, Arc::new(Progress::default())).unwrap();
+    let metadata = result.metadata.as_ref().unwrap();
+    assert_eq!(metadata["postquantum"], "yes");
+    assert!(!metadata.to_string().contains("private payload"));
+    assert!(result.text.is_none());
+}
+
+fn plugin_fixture() -> tempfile::TempDir {
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("target/testplugin/age-plugin-desktoptest.exe");
+    assert!(
+        source.is_file(),
+        "run scripts/build-engine.ps1 -Tests first"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(source, dir.path().join("age-plugin-desktoptest.exe")).unwrap();
+    dir
+}
+#[test]
+fn plugin_secret_confirmation_identity_and_recipient_workflows() {
+    let plugin = plugin_fixture();
+    let mut r = Request::new("encrypt");
+    r.protection = "plugin".into();
+    r.plugins = vec!["desktoptest".into()];
+    r.plugin_dir = plugin.path().to_str().unwrap().into();
+    r.text = Some("plugin protocol payload".into());
+    let encrypted = with_replies(|p| engine::run(&r, p)).unwrap();
+    r.operation = "decrypt".into();
+    r.text = encrypted.text.clone();
+    let decrypted = with_replies(|p| engine::run(&r, p)).unwrap();
+    assert_eq!(decrypted.text.as_deref(), Some("plugin protocol payload"));
+    let public = std::process::Command::new(plugin.path().join("age-plugin-desktoptest.exe"))
+        .arg("--recipient")
+        .output()
+        .unwrap();
+    assert!(public.status.success());
+    r.operation = "encrypt".into();
+    r.recipients = String::from_utf8(public.stdout).unwrap();
+    r.plugins.clear();
+    r.text = Some("recipient plugin path".into());
+    assert!(with_replies(|p| engine::run(&r, p)).is_ok());
+}
+
+#[cfg(windows)]
+#[test]
+fn cancelling_plugin_prompt_terminates_exact_owned_plugin_process() {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, WAIT_OBJECT_0},
+        System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+    let plugin = plugin_fixture();
+    let mut r = Request::new("encrypt");
+    r.protection = "plugin".into();
+    r.plugins = vec!["desktoptest".into()];
+    r.plugin_dir = plugin.path().to_str().unwrap().into();
+    r.text = Some("cancel fixture".into());
+    let p = Arc::new(Progress::default());
+    let worker = {
+        let p = p.clone();
+        thread::spawn(move || engine::run(&r, p))
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while p.prompt.lock().unwrap().is_none() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let pid: u32 = fs::read_to_string(plugin.path().join("plugin.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    // Open a handle while the exact fixture process is still alive. Waiting on
+    // this handle cannot confuse a recycled PID with the owned plugin.
+    unsafe {
+        let process = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        assert!(!process.is_null());
+        p.cancel();
+        assert!(worker.join().unwrap().is_err());
+        assert_eq!(WaitForSingleObject(process, 5000), WAIT_OBJECT_0);
+        CloseHandle(process);
+    }
+}
+
+#[test]
+fn mode_selection_rejects_wrong_key_type() {
+    let (d, _, _) = fixture();
+    let (_, public) = key(d.path(), "classic", false);
+    let mut r = enc(&public, false);
+    r.protection = "pq".into();
+    r.text = Some("must not silently use classic".into());
+    assert!(engine::run(&r, Arc::new(Progress::default())).is_err());
+}
+
+#[test]
+fn binary_decryption_is_not_silently_converted_to_text() {
+    let (d, input, _) = fixture();
+    let (id, public) = key(d.path(), "pq", false);
+    let encrypted = success(&run(job(
+        &input,
+        d.path(),
+        Operation::Encrypt,
+        enc(&public, true),
+    )));
+    let mut r = dec(&id);
+    r.text = Some(fs::read_to_string(encrypted).unwrap());
+    assert!(engine::run(&r, Arc::new(Progress::default())).is_err());
+}
+
+#[test]
+fn public_errors_do_not_echo_secret_identity() {
+    let mut r = Request::new("encrypt");
+    r.recipients = "AGE-SECRET-KEY-sensitive-fixture".into();
+    r.text = Some("fixture".into());
+    let error = match engine::run(&r, Arc::new(Progress::default())) {
+        Ok(Response { .. }) => panic!("invalid recipient accepted"),
+        Err(e) => e,
+    };
+    assert!(!error.contains("sensitive-fixture"));
 }

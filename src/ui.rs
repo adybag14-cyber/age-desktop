@@ -1,16 +1,15 @@
+mod views;
 use crate::Options;
-use age::secrecy::SecretString;
-use age_desktop::crypto::{self, Credential, FileResult, Job, Operation, Progress};
-use iced::widget::{self, column, container, row, scrollable, space, text};
-use iced::{
-    Alignment, Background, Border, Color, Element, Length, Subscription, Task, Theme, window,
+use age_desktop::{
+    crypto::{self, FileResult, Job, Operation},
+    engine::{self, Progress, Prompt, Request, Response},
 };
-use shadcn_iced::prelude::*;
-use shadcn_iced::{self as shad, font, tokens};
+use iced::{Element, Subscription, Task, Theme, window};
+use shadcn_iced::{self as shad, Mode};
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, atomic::Ordering},
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -19,32 +18,122 @@ pub enum Page {
     Encrypt,
     Decrypt,
     Keys,
+    Inspect,
+    Settings,
     Guide,
 }
 impl Page {
     fn title(self) -> &'static str {
         match self {
-            Self::Encrypt => "Encrypt files",
-            Self::Decrypt => "Decrypt files",
+            Self::Encrypt => "Encrypt",
+            Self::Decrypt => "Decrypt",
             Self::Keys => "Your keys",
-            Self::Guide => "A little peace of mind.",
-        }
-    }
-    fn operation(self) -> Operation {
-        if self == Self::Decrypt {
-            Operation::Decrypt
-        } else {
-            Operation::Encrypt
+            Self::Inspect => "Inspect a file",
+            Self::Settings => "Tools & settings",
+            Self::Guide => "How it works",
         }
     }
 }
-
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Method {
-    Key,
-    Passphrase,
+pub enum InputMode {
+    Files,
+    Text,
 }
-
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Protection {
+    Classic,
+    Pq,
+    Passphrase,
+    Ssh,
+    Plugin,
+    Auto,
+}
+impl Protection {
+    const ALL: [Self; 6] = [
+        Self::Pq,
+        Self::Classic,
+        Self::Passphrase,
+        Self::Ssh,
+        Self::Plugin,
+        Self::Auto,
+    ];
+    fn code(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::Pq => "pq",
+            Self::Passphrase => "passphrase",
+            Self::Ssh => "ssh",
+            Self::Plugin => "plugin",
+            Self::Auto => "auto",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic · X25519",
+            Self::Pq => "Post-quantum · ML-KEM + X25519",
+            Self::Passphrase => "Passphrase · scrypt",
+            Self::Ssh => "SSH · Ed25519 or RSA",
+            Self::Plugin => "Plugin / hardware key",
+            Self::Auto => "Detect from recipient keys",
+        }
+    }
+    fn help(self) -> &'static str {
+        match self {
+            Self::Classic => {
+                "Use compact age1 public keys. Compatible with older age applications."
+            }
+            Self::Pq => {
+                "Hybrid ML-KEM-768 + X25519 protects against future quantum attacks. Requires age1pq1 keys and age 1.3+."
+            }
+            Self::Passphrase => {
+                "Anyone with the passphrase can decrypt. Share it separately from the encrypted file."
+            }
+            Self::Ssh => {
+                "Use an existing ssh-ed25519 or ssh-rsa public key. The matching private key unlocks the file; ssh-agent is not supported."
+            }
+            Self::Plugin => {
+                "Use a plugin recipient, identity file, or plugin name. PINs, confirmations, and touch requests appear here."
+            }
+            Self::Auto => {
+                "Keys determine the protection. Multiple recipients can each decrypt; age rejects incompatible combinations."
+            }
+        }
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    Pq,
+    Classic,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SecretTarget {
+    File,
+    Key,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    Inputs,
+    Recipients,
+    Identities,
+    KeyOpen,
+    Inspect,
+    OutputDir,
+    OutputFile,
+    KeySave,
+    PublicSave,
+    TextSave,
+    InspectSave,
+    PluginDir,
+}
+#[derive(Clone)]
+pub enum Purpose {
+    Text,
+    GeneratedKey(PathBuf),
+    PublicKeys(Vec<PathBuf>),
+    Inspect,
+    Password(SecretTarget),
+    Version,
+}
 #[derive(Clone)]
 struct SelectedFile {
     path: PathBuf,
@@ -54,42 +143,59 @@ struct SelectedFile {
 #[derive(Clone)]
 pub enum Message {
     Navigate(Page),
-    Method(Method),
-    PickFiles,
-    FilesPicked(Vec<PathBuf>),
-    RemoveFile(usize),
+    InputMode(InputMode),
+    Protection(Protection),
+    KeyKind(KeyKind),
+    Pick(Pick),
+    Picked(Pick, Vec<PathBuf>),
+    Remove(Pick, usize),
     ClearFiles,
     Recipients(shad::textarea::Action),
-    Password(Zeroizing<String>),
-    Confirm(Zeroizing<String>),
-    Reveal,
-    PickIdentity,
-    IdentityPicked(Option<PathBuf>),
-    IdentityReady(PathBuf, Result<Vec<String>, String>),
-    GenerateKey,
-    KeyGenerated(Option<(PathBuf, Result<String, String>)>),
+    TextEdit(shad::textarea::Action),
+    Password(SecretTarget, Zeroizing<String>),
+    Confirm(SecretTarget, Zeroizing<String>),
+    Reveal(SecretTarget),
+    GeneratePassword(SecretTarget),
+    ProtectKey(bool),
+    PluginNames(String),
+    PasteIdentity,
+    IdentityPasted(Option<String>),
+    ClearIdentity,
+    PasteText,
+    TextPasted(Option<String>),
+    Armor(bool),
+    Overwrite(bool),
+    ResetOutput,
+    Start,
+    StartConfirmed,
+    ConfirmReplace(bool),
+    Cancel,
+    Tick,
+    Finished(Vec<FileResult>),
+    EngineDone(Purpose, Result<Response, String>),
+    PromptReply(bool),
+    PromptValue(Zeroizing<String>),
     CopyPublic,
     UsePublic,
-    PickOutput,
-    OutputPicked(Option<PathBuf>),
-    ResetOutput,
-    Armor(bool),
-    Start,
-    Cancel,
-    Finished(Vec<FileResult>),
-    Tick,
+    CopyText,
+    UseTextOutput,
+    CopyInspection,
+    CopyCommand,
+    InspectInput,
+    TextSaved(Result<(), String>),
+    CheckEngine,
     ToggleTheme,
+    Renderer(String),
+    Restart,
     Dismiss,
     Window(window::Id, window::Event),
+    Close(window::Id),
+    Stay,
     FirstFrame,
     System(iced::system::Information),
     Captured(window::Screenshot),
     ProbeExit,
-    Close(window::Id),
-    Stay,
 }
-
-// Input events can contain secrets. Do not let debug tools format their data.
 impl std::fmt::Debug for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("UI event (data redacted)")
@@ -98,371 +204,797 @@ impl std::fmt::Debug for Message {
 
 pub struct App {
     page: Page,
-    method: Method,
+    operation: Operation,
+    input_mode: InputMode,
+    protection: Protection,
     files: Vec<SelectedFile>,
     recipients: shad::textarea::Content,
+    recipient_files: Vec<PathBuf>,
+    identities: Vec<PathBuf>,
+    identity_text: Zeroizing<String>,
+    text_input: shad::textarea::Content,
+    text_output: Zeroizing<String>,
     password: Zeroizing<String>,
     confirmation: Zeroizing<String>,
     reveal: bool,
-    identity: Option<PathBuf>,
+    key_password: Zeroizing<String>,
+    key_confirmation: Zeroizing<String>,
+    key_reveal: bool,
+    key_kind: KeyKind,
+    protect_key: bool,
+    key_paths: Vec<PathBuf>,
     public_keys: Vec<String>,
-    output: Option<PathBuf>,
+    plugin_names: String,
+    plugin_dir: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    output_file: Option<PathBuf>,
     armor: bool,
+    overwrite: bool,
+    confirm_replace: bool,
+    inspect_path: Option<PathBuf>,
+    inspection: Option<serde_json::Value>,
+    engine_info: String,
+    graphics_info: String,
+    next_renderer: String,
     dark: bool,
+    picker_open: bool,
     progress: Option<Arc<Progress>>,
+    prompt: Option<Prompt>,
+    prompt_value: Zeroizing<String>,
+    task_title: String,
+    status: String,
     results: Vec<FileResult>,
     notice: Option<(bool, String)>,
-    started_job: Option<Instant>,
     close_requested: Option<window::Id>,
-    picker_open: bool,
+    hovered: bool,
     options: Options,
     first_frame: Option<f64>,
-    hovered: bool,
 }
-
 impl App {
     pub fn boot(options: Options) -> (Self, Task<Message>) {
         let initial = options.files.clone();
+        let page = match options.page.as_str() {
+            "decrypt" => Page::Decrypt,
+            "keys" => Page::Keys,
+            "inspect" => Page::Inspect,
+            "settings" => Page::Settings,
+            "guide" => Page::Guide,
+            _ => Page::Encrypt,
+        };
+        let renderer = options.renderer.clone();
+        let dark = options.dark;
         let app = Self {
-            page: Page::Encrypt,
-            method: Method::Key,
-            files: Vec::new(),
+            page,
+            operation: if page == Page::Decrypt {
+                Operation::Decrypt
+            } else {
+                Operation::Encrypt
+            },
+            input_mode: InputMode::Files,
+            protection: Protection::Pq,
+            files: vec![],
             recipients: shad::textarea::Content::new(),
+            recipient_files: vec![],
+            identities: vec![],
+            identity_text: Zeroizing::new(String::new()),
+            text_input: shad::textarea::Content::new(),
+            text_output: Zeroizing::new(String::new()),
             password: Zeroizing::new(String::new()),
             confirmation: Zeroizing::new(String::new()),
             reveal: false,
-            identity: None,
-            public_keys: Vec::new(),
-            output: None,
+            key_password: Zeroizing::new(String::new()),
+            key_confirmation: Zeroizing::new(String::new()),
+            key_reveal: false,
+            key_kind: KeyKind::Pq,
+            protect_key: false,
+            key_paths: vec![],
+            public_keys: vec![],
+            plugin_names: String::new(),
+            plugin_dir: None,
+            output_dir: None,
+            output_file: None,
             armor: false,
-            dark: options.dark,
-            progress: None,
-            results: Vec::new(),
-            notice: None,
-            started_job: None,
-            close_requested: None,
+            overwrite: false,
+            confirm_replace: false,
+            inspect_path: None,
+            inspection: None,
+            engine_info: "Official age 1.3.2 · loaded only when needed".into(),
+            graphics_info: String::new(),
+            next_renderer: renderer,
+            dark,
             picker_open: false,
+            progress: None,
+            prompt: None,
+            prompt_value: Zeroizing::new(String::new()),
+            task_title: String::new(),
+            status: String::new(),
+            results: vec![],
+            notice: None,
+            close_requested: None,
+            hovered: false,
             options,
             first_frame: None,
-            hovered: false,
         };
         (
             app,
             if initial.is_empty() {
                 Task::none()
             } else {
-                Task::done(Message::FilesPicked(initial))
+                Task::done(Message::Picked(
+                    if page == Page::Inspect {
+                        Pick::Inspect
+                    } else if page == Page::Keys {
+                        Pick::KeyOpen
+                    } else {
+                        Pick::Inputs
+                    },
+                    initial,
+                ))
             },
         )
     }
-
     pub fn theme(&self) -> Theme {
         shad::theme::zinc(if self.dark { Mode::Dark } else { Mode::Light }).build()
     }
-
-    pub fn subscription(&self) -> Subscription<Message> {
-        let mut subscriptions =
-            vec![window::events().map(|(id, event)| Message::Window(id, event))];
-        if self.first_frame.is_none() {
-            subscriptions.push(window::frames().map(|_| Message::FirstFrame));
-        }
-        if self.busy() {
-            subscriptions
-                .push(iced::time::every(Duration::from_millis(100)).map(|_| Message::Tick));
-        }
-        subscriptions.push(iced::event::listen_with(|event, status, _id| {
-            if status == iced::event::Status::Captured {
-                return None;
-            }
-            let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) =
-                event
-            else {
-                return None;
-            };
-            shortcut(&key, modifiers)
-        }));
-        Subscription::batch(subscriptions)
-    }
-
     fn busy(&self) -> bool {
         self.progress.is_some()
     }
     fn blocked(&self) -> bool {
-        self.busy() || self.picker_open
+        self.busy() || self.picker_open || self.confirm_replace
     }
-    fn total_size(&self) -> u64 {
+    fn size(&self) -> u64 {
         self.files.iter().map(|f| f.size).sum()
     }
-    fn clear_secrets(&mut self) {
+    fn working(&self) -> bool {
+        matches!(self.page, Page::Encrypt | Page::Decrypt)
+    }
+    fn clear_passwords(&mut self) {
         self.password.zeroize();
         self.confirmation.zeroize();
+        self.key_password.zeroize();
+        self.key_confirmation.zeroize();
+        self.prompt_value.zeroize();
         self.reveal = false;
+        self.key_reveal = false;
     }
-
+    fn notice(&mut self, error: bool, message: impl Into<String>) {
+        self.notice = Some((error, message.into()));
+    }
+    fn progress(&mut self, title: &str) -> Arc<Progress> {
+        let p = Arc::new(Progress::default());
+        self.progress = Some(p.clone());
+        self.task_title = title.into();
+        self.status = String::new();
+        self.notice = None;
+        p
+    }
+    fn finish(&mut self) {
+        self.progress = None;
+        self.prompt = None;
+        self.prompt_value.zeroize();
+        self.status.clear();
+    }
+    fn request(&self, operation: &str) -> Result<Request, String> {
+        let mut r = Request::new(operation);
+        r.protection = self.protection.code().into();
+        r.armor = self.armor;
+        r.plugin_dir = self
+            .plugin_dir
+            .as_ref()
+            .map(|p| crypto::path_string(p))
+            .transpose()?
+            .unwrap_or_default();
+        if operation == "encrypt" && self.protection == Protection::Passphrase {
+            r.passphrase = self.password.to_string();
+            return Ok(r);
+        }
+        r.recipients = self.recipients.text();
+        r.recipient_files = self
+            .recipient_files
+            .iter()
+            .map(|p| crypto::path_string(p))
+            .collect::<Result<_, _>>()?;
+        r.identity_files = self
+            .identities
+            .iter()
+            .map(|p| crypto::path_string(p))
+            .collect::<Result<_, _>>()?;
+        r.identity_text = self.identity_text.to_string();
+        r.plugins = self
+            .plugin_names
+            .split([',', ' ', '\n'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if operation == "decrypt" {
+            r.recipients.clear();
+            r.recipient_files.clear();
+            r.passphrase = self.password.to_string();
+            r.protection = "auto".into();
+        }
+        Ok(r)
+    }
+    fn launch_engine(&mut self, purpose: Purpose, request: Request, title: &str) -> Task<Message> {
+        let p = self.progress(title);
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || engine::run(&request, p))
+                    .await
+                    .unwrap_or_else(|_| Err("Engine worker stopped unexpectedly.".into()))
+            },
+            move |result| Message::EngineDone(purpose.clone(), result),
+        )
+    }
+    pub fn subscription(&self) -> Subscription<Message> {
+        let mut s = vec![
+            window::events().map(|(id, event)| Message::Window(id, event)),
+            iced::event::listen_with(|event, status, _| {
+                if status == iced::event::Status::Captured {
+                    return None;
+                }
+                if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key,
+                    modifiers,
+                    ..
+                }) = event
+                {
+                    shortcut(&key, modifiers)
+                } else {
+                    None
+                }
+            }),
+        ];
+        if self.first_frame.is_none() {
+            s.push(window::frames().map(|_| Message::FirstFrame));
+        }
+        if self.busy() {
+            s.push(iced::time::every(Duration::from_millis(100)).map(|_| Message::Tick));
+        }
+        Subscription::batch(s)
+    }
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let previous_page = self.page;
+        let previous_mode = self.input_mode;
+        let show_result = matches!(
+            &message,
+            Message::Finished(_)
+                | Message::EngineDone(
+                    Purpose::Text
+                        | Purpose::GeneratedKey(_)
+                        | Purpose::PublicKeys(_)
+                        | Purpose::Inspect,
+                    _
+                )
+                | Message::EngineDone(_, Err(_))
+        );
         match message {
             Message::Navigate(page) if !self.blocked() => {
-                if self.page != page {
-                    self.page = page;
-                    self.files.clear();
-                    self.results.clear();
-                    self.notice = None;
-                    self.clear_secrets();
+                if matches!(page, Page::Encrypt | Page::Decrypt) {
+                    let operation = if page == Page::Encrypt {
+                        Operation::Encrypt
+                    } else {
+                        Operation::Decrypt
+                    };
+                    if operation != self.operation {
+                        self.files.clear();
+                        self.text_input = shad::textarea::Content::new();
+                        self.text_output.zeroize();
+                        self.output_file = None;
+                    }
+                    self.operation = operation;
                 }
-            }
-            Message::Method(method) if !self.blocked() => {
-                self.method = method;
-                self.clear_secrets();
+                self.page = page;
                 self.notice = None;
+                self.clear_passwords();
+                self.results.clear();
+                if page == Page::Settings {
+                    return Task::batch([
+                        iced::system::information().map(Message::System),
+                        iced::widget::operation::snap_to(
+                            "workspace-scroll",
+                            iced::widget::operation::RelativeOffset::START,
+                        ),
+                    ]);
+                }
             }
-            Message::PickFiles
-                if !self.blocked() && matches!(self.page, Page::Encrypt | Page::Decrypt) =>
-            {
-                self.picker_open = true;
-                return Task::perform(
-                    async {
-                        rfd::AsyncFileDialog::new()
-                            .set_title("Choose files")
-                            .pick_files()
-                            .await
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|f| f.path().to_owned())
-                            .collect()
-                    },
-                    Message::FilesPicked,
-                );
-            }
-            Message::FilesPicked(paths) => {
-                self.picker_open = false;
-                if self.busy() {
-                    return Task::none();
-                }
-                if !matches!(self.page, Page::Encrypt | Page::Decrypt) {
-                    return Task::none();
-                }
-                for path in paths {
-                    if self.files.iter().any(|f| f.path == path) {
-                        continue;
-                    }
-                    match crypto::file_size(&path) {
-                        Ok(size) => self.files.push(SelectedFile { path, size }),
-                        Err(error) => self.notice = Some((true, error)),
-                    }
-                }
+            Message::InputMode(mode) if !self.blocked() => {
+                self.input_mode = mode;
+                self.notice = None;
                 self.results.clear();
             }
-            Message::RemoveFile(i) if !self.blocked() => {
-                if i < self.files.len() {
-                    self.files.remove(i);
-                    self.results.clear();
+            Message::Protection(p) if !self.blocked() => {
+                self.protection = p;
+                self.password.zeroize();
+                self.confirmation.zeroize();
+                self.notice = None;
+            }
+            Message::KeyKind(k) if !self.blocked() => self.key_kind = k,
+            Message::Pick(pick) if !self.blocked() => {
+                if pick == Pick::KeySave
+                    && self.protect_key
+                    && let Err(e) = password_valid(&self.key_password, &self.key_confirmation)
+                {
+                    self.notice(true, e);
+                    return Task::none();
                 }
+                if pick == Pick::OutputFile && self.files.len() != 1 {
+                    self.notice(true, "Choose one input file to use Save as.");
+                    return Task::none();
+                }
+                self.picker_open = true;
+                let default_name = match pick {
+                    Pick::KeySave => {
+                        if self.protect_key {
+                            "identity.age"
+                        } else {
+                            "identity.agekey"
+                        }
+                    }
+                    Pick::PublicSave => "recipients.txt",
+                    Pick::TextSave => {
+                        if self.operation == Operation::Encrypt {
+                            "message.age.txt"
+                        } else {
+                            "message.txt"
+                        }
+                    }
+                    Pick::InspectSave => "age-inspection.json",
+                    _ => "output.age",
+                }
+                .to_owned();
+                let output_name = if pick == Pick::OutputFile {
+                    self.files
+                        .first()
+                        .and_then(|f| {
+                            crypto::output_path(&f.path, None, self.operation, self.armor).ok()
+                        })
+                        .map(|p| filename(&p))
+                        .unwrap_or(default_name)
+                } else {
+                    default_name
+                };
+                return Task::perform(
+                    async move {
+                        let dialog = rfd::AsyncFileDialog::new();
+                        match pick {
+                            Pick::OutputDir | Pick::PluginDir => dialog
+                                .set_title(if pick == Pick::PluginDir {
+                                    "Choose the folder containing age plugins"
+                                } else {
+                                    "Choose output folder"
+                                })
+                                .pick_folder()
+                                .await
+                                .map(|f| vec![f.path().to_owned()])
+                                .unwrap_or_default(),
+                            Pick::KeySave
+                            | Pick::PublicSave
+                            | Pick::TextSave
+                            | Pick::InspectSave
+                            | Pick::OutputFile => dialog
+                                .set_title(if pick == Pick::KeySave {
+                                    "Save your secret identity"
+                                } else {
+                                    "Save a new file"
+                                })
+                                .set_file_name(output_name)
+                                .save_file()
+                                .await
+                                .map(|f| vec![f.path().to_owned()])
+                                .unwrap_or_default(),
+                            Pick::Inspect => dialog
+                                .set_title("Choose an encrypted age file")
+                                .pick_file()
+                                .await
+                                .map(|f| vec![f.path().to_owned()])
+                                .unwrap_or_default(),
+                            _ => dialog
+                                .set_title(match pick {
+                                    Pick::Recipients => "Choose recipient / SSH public-key files",
+                                    Pick::Identities | Pick::KeyOpen => {
+                                        "Choose age or SSH identity files"
+                                    }
+                                    _ => "Choose input files",
+                                })
+                                .pick_files()
+                                .await
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|f| f.path().to_owned())
+                                .collect(),
+                        }
+                    },
+                    move |paths| Message::Picked(pick, paths),
+                );
+            }
+            Message::Picked(pick, paths) => {
+                self.picker_open = false;
+                if paths.is_empty() || self.busy() {
+                    return Task::none();
+                }
+                match pick {
+                    Pick::Inputs => {
+                        for path in paths {
+                            if self.files.iter().any(|f| f.path == path) {
+                                continue;
+                            }
+                            match crypto::file_size(&path) {
+                                Ok(size) => self.files.push(SelectedFile { path, size }),
+                                Err(e) => self.notice(true, e),
+                            }
+                        }
+                        self.results.clear();
+                        if self.files.len() > 1 {
+                            self.output_file = None;
+                        }
+                    }
+                    Pick::Recipients => append_unique(&mut self.recipient_files, paths),
+                    Pick::Identities => append_unique(&mut self.identities, paths),
+                    Pick::PluginDir => self.plugin_dir = paths.first().cloned(),
+                    Pick::OutputDir => {
+                        self.output_dir = paths.first().cloned();
+                        self.output_file = None;
+                    }
+                    Pick::OutputFile => self.output_file = paths.first().cloned(),
+                    Pick::KeySave => {
+                        let path = paths[0].clone();
+                        let mut r = Request::new("generate_key");
+                        r.key_kind = if self.key_kind == KeyKind::Pq {
+                            "pq"
+                        } else {
+                            "classic"
+                        }
+                        .into();
+                        r.protect_key = self.protect_key;
+                        r.passphrase = std::mem::take(&mut *self.key_password);
+                        self.key_confirmation.zeroize();
+                        let p = self.progress("Creating your identity");
+                        let target = path.clone();
+                        return Task::perform(
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    crypto::generate_identity(&target, r, p)
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err("Key worker stopped.".into()))
+                            },
+                            move |result| {
+                                Message::EngineDone(Purpose::GeneratedKey(path.clone()), result)
+                            },
+                        );
+                    }
+                    Pick::KeyOpen => {
+                        let mut r = Request::new("public_keys");
+                        r.identity_files = paths
+                            .iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect();
+                        r.plugin_dir = self
+                            .plugin_dir
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        return self.launch_engine(
+                            Purpose::PublicKeys(paths),
+                            r,
+                            "Opening your identities",
+                        );
+                    }
+                    Pick::Inspect => {
+                        self.inspect_path = Some(paths[0].clone());
+                        let mut r = Request::new("inspect");
+                        r.input = paths[0].to_string_lossy().into_owned();
+                        return self.launch_engine(
+                            Purpose::Inspect,
+                            r,
+                            "Inspecting the encrypted file",
+                        );
+                    }
+                    Pick::PublicSave | Pick::TextSave | Pick::InspectSave => {
+                        let content = match pick {
+                            Pick::PublicSave => format!("{}\n", self.public_keys.join("\n")),
+                            Pick::InspectSave => {
+                                serde_json::to_string_pretty(&self.inspection).unwrap_or_default()
+                            }
+                            _ => self.text_output.to_string(),
+                        };
+                        let private =
+                            pick == Pick::TextSave && self.operation == Operation::Decrypt;
+                        let path = paths[0].clone();
+                        return Task::perform(
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    crypto::save_text(&path, &content, private)
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err("Save worker stopped.".into()))
+                            },
+                            Message::TextSaved,
+                        );
+                    }
+                }
+            }
+            Message::Remove(kind, i) if !self.blocked() => {
+                match kind {
+                    Pick::Inputs => {
+                        if i < self.files.len() {
+                            self.files.remove(i);
+                        }
+                    }
+                    Pick::Recipients => {
+                        if i < self.recipient_files.len() {
+                            self.recipient_files.remove(i);
+                        }
+                    }
+                    Pick::Identities => {
+                        if i < self.identities.len() {
+                            self.identities.remove(i);
+                        }
+                    }
+                    _ => {}
+                }
+                self.results.clear();
             }
             Message::ClearFiles if !self.blocked() => {
                 self.files.clear();
                 self.results.clear();
+                self.output_file = None;
             }
-            Message::Recipients(action) if !self.blocked() => {
-                self.recipients.perform(action);
-                self.notice = None;
-            }
-            Message::Password(value) if !self.blocked() => self.password = value,
-            Message::Confirm(value) if !self.blocked() => self.confirmation = value,
-            Message::Reveal => self.reveal = !self.reveal,
-            Message::PickIdentity if !self.blocked() => {
-                self.picker_open = true;
-                return Task::perform(
-                    async {
-                        rfd::AsyncFileDialog::new()
-                            .set_title("Open an age identity file")
-                            .pick_file()
-                            .await
-                            .map(|f| f.path().to_owned())
-                    },
-                    Message::IdentityPicked,
+            Message::Recipients(action) if !self.blocked() => self.recipients.perform(action),
+            Message::TextEdit(action) if !self.blocked() => self.text_input.perform(action),
+            Message::Password(target, value) if !self.blocked() => match target {
+                SecretTarget::Key => self.key_password = value,
+                _ => self.password = value,
+            },
+            Message::Confirm(target, value) if !self.blocked() => match target {
+                SecretTarget::Key => self.key_confirmation = value,
+                _ => self.confirmation = value,
+            },
+            Message::Reveal(target) => match target {
+                SecretTarget::Key => self.key_reveal = !self.key_reveal,
+                _ => self.reveal = !self.reveal,
+            },
+            Message::GeneratePassword(target) if !self.blocked() => {
+                return self.launch_engine(
+                    Purpose::Password(target),
+                    Request::new("generate_passphrase"),
+                    "Generating a secure passphrase",
                 );
             }
-            Message::IdentityPicked(path) => {
-                if let Some(path) = path {
-                    return Task::perform(
-                        async move {
-                            let p = path.clone();
-                            let result =
-                                tokio::task::spawn_blocking(move || crypto::inspect_identity(&p))
-                                    .await
-                                    .unwrap_or_else(|_| {
-                                        Err("Key reader stopped unexpectedly.".into())
-                                    });
-                            (path, result)
-                        },
-                        |(path, result)| Message::IdentityReady(path, result),
+            Message::ProtectKey(value) if !self.blocked() => self.protect_key = value,
+            Message::PluginNames(value) if !self.blocked() => self.plugin_names = value,
+            Message::PasteIdentity if !self.blocked() => {
+                return iced::clipboard::read().map(Message::IdentityPasted);
+            }
+            Message::IdentityPasted(Some(value)) => {
+                if value.len() > 16 * 1024 * 1024 {
+                    self.notice(true, "Pasted identity exceeds 16 MiB.");
+                } else {
+                    self.identity_text = Zeroizing::new(value);
+                    self.notice(
+                        false,
+                        "Pasted identity loaded for this session. Its secret is hidden.",
                     );
                 }
-                self.picker_open = false;
             }
-            Message::IdentityReady(path, result) => {
-                self.picker_open = false;
-                match result {
-                    Ok(public) => {
-                        self.identity = Some(path);
-                        self.public_keys = public;
-                        self.notice = Some((
-                            false,
-                            "Identity loaded. Only the public key is shown here.".into(),
-                        ));
-                    }
-                    Err(error) => self.notice = Some((true, error)),
+            Message::ClearIdentity if !self.blocked() => self.identity_text.zeroize(),
+            Message::PasteText if !self.blocked() => {
+                return iced::clipboard::read().map(Message::TextPasted);
+            }
+            Message::TextPasted(Some(value)) => {
+                if value.len() > 2 * 1024 * 1024 {
+                    self.notice(true, "Use Files for text larger than 2 MiB.");
+                } else {
+                    self.text_input = shad::textarea::Content::with_text(&value);
                 }
             }
-            Message::GenerateKey if !self.blocked() => {
-                self.picker_open = true;
-                return Task::perform(
-                    async {
-                        let target = rfd::AsyncFileDialog::new()
-                            .set_title("Save your secret age identity — keep this file private")
-                            .set_file_name("identity.agekey")
-                            .save_file()
-                            .await?;
-                        let path = target.path().to_owned();
-                        let p = path.clone();
-                        let result =
-                            tokio::task::spawn_blocking(move || crypto::generate_identity(&p))
-                                .await
-                                .unwrap_or_else(|_| {
-                                    Err("Key generation stopped unexpectedly.".into())
-                                });
-                        Some((path, result))
-                    },
-                    Message::KeyGenerated,
-                );
-            }
-            Message::KeyGenerated(result) => {
-                self.picker_open = false;
-                if let Some((path, result)) = result {
-                    match result {
-                        Ok(key) => {
-                            self.identity = Some(path);
-                            self.public_keys = vec![key];
-                            self.notice = Some((
-                                false,
-                                "Key created. Keep the secret identity file safe and backed up."
-                                    .into(),
-                            ));
-                        }
-                        Err(error) => self.notice = Some((true, error)),
-                    }
-                }
-            }
-            Message::CopyPublic => {
-                if !self.public_keys.is_empty() {
-                    self.notice = Some((false, "Public key copied. It is safe to share.".into()));
-                    return iced::clipboard::write(self.public_keys.join("\n"));
-                }
-            }
-            Message::UsePublic if !self.blocked() => {
-                self.page = Page::Encrypt;
-                self.method = Method::Key;
-                self.files.clear();
-                self.results.clear();
-                self.recipients = shad::textarea::Content::with_text(&self.public_keys.join("\n"));
-                self.clear_secrets();
-                self.notice = None;
-            }
-            Message::PickOutput if !self.blocked() => {
-                self.picker_open = true;
-                return Task::perform(
-                    async {
-                        rfd::AsyncFileDialog::new()
-                            .set_title("Choose output folder")
-                            .pick_folder()
-                            .await
-                            .map(|f| f.path().to_owned())
-                    },
-                    Message::OutputPicked,
-                );
-            }
-            Message::OutputPicked(path) => {
-                self.picker_open = false;
-                if let Some(path) = path {
-                    self.output = Some(path);
-                }
-            }
-            Message::ResetOutput if !self.blocked() => self.output = None,
             Message::Armor(value) if !self.blocked() => self.armor = value,
-            Message::Start
-                if !self.blocked() && matches!(self.page, Page::Encrypt | Page::Decrypt) =>
-            {
-                if let Err(error) = self.validate() {
-                    self.notice = Some((true, error));
+            Message::Overwrite(value) if !self.blocked() => self.overwrite = value,
+            Message::ResetOutput if !self.blocked() => {
+                self.output_dir = None;
+                self.output_file = None;
+            }
+            Message::Start if !self.blocked() && self.working() => {
+                if let Err(e) = self.validate() {
+                    self.notice(true, e);
                     return Task::none();
                 }
-                let credential = if self.method == Method::Passphrase {
-                    Credential::Passphrase(SecretString::from(std::mem::take(&mut *self.password)))
-                } else if self.page == Page::Encrypt {
-                    Credential::Recipients(self.recipients.text())
+                if self.overwrite && self.input_mode == InputMode::Files {
+                    self.confirm_replace = true;
                 } else {
-                    Credential::IdentityFile(self.identity.clone().expect("validated identity"))
-                };
-                self.clear_secrets();
-                let job = Job {
-                    operation: self.page.operation(),
-                    inputs: self.files.iter().map(|f| f.path.clone()).collect(),
-                    output_dir: self.output.clone(),
-                    armor: self.armor,
-                    credential,
-                };
-                let progress = Arc::new(Progress::default());
-                self.progress = Some(progress.clone());
-                self.started_job = Some(Instant::now());
-                self.results.clear();
-                self.notice = None;
-                return Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || crypto::run(job, progress))
-                            .await
-                            .unwrap_or_else(|_| {
-                                vec![FileResult {
-                                    input: PathBuf::from("Operation"),
-                                    output: None,
-                                    error: Some("The worker stopped unexpectedly.".into()),
-                                }]
-                            })
-                    },
-                    Message::Finished,
-                );
-            }
-            Message::Cancel => {
-                if let Some(progress) = &self.progress {
-                    progress.cancelled.store(true, Ordering::Relaxed);
+                    return self.start();
                 }
             }
+            Message::StartConfirmed => {
+                self.confirm_replace = false;
+                if !self.busy() {
+                    return self.start();
+                }
+            }
+            Message::ConfirmReplace(false) => self.confirm_replace = false,
+            Message::ConfirmReplace(true) => return Task::done(Message::StartConfirmed),
+            Message::Cancel => {
+                if let Some(p) = &self.progress {
+                    p.cancel();
+                }
+                self.prompt = None;
+                self.prompt_value.zeroize();
+            }
+            Message::Tick => {
+                if let Some(p) = &self.progress {
+                    let prompt = p.prompt.lock().unwrap().clone();
+                    if self.prompt.as_ref().map(|p| p.id) != prompt.as_ref().map(|p| p.id) {
+                        self.prompt_value.zeroize();
+                    }
+                    self.prompt = prompt;
+                    self.status = p.status.lock().unwrap().clone();
+                }
+            }
+            Message::PromptValue(value) => self.prompt_value = value,
+            Message::PromptReply(yes) => {
+                if let (Some(prompt), Some(p)) = (&self.prompt, &self.progress) {
+                    let value = if !prompt.yes.is_empty() {
+                        if yes { "yes" } else { "no" }.into()
+                    } else {
+                        std::mem::take(&mut *self.prompt_value)
+                    };
+                    p.respond(prompt.id, value, false);
+                }
+                self.prompt = None;
+                self.prompt_value.zeroize();
+            }
             Message::Finished(results) => {
-                self.progress = None;
+                self.finish();
                 self.results = results;
-                let ok = self.results.iter().filter(|r| r.output.is_some()).count();
-                self.notice = Some((
-                    ok != self.results.len(),
+                let successes = self.results.iter().filter(|r| r.output.is_some()).count();
+                self.notice(
+                    successes != self.results.len(),
                     format!(
                         "{} of {} files {}. Originals are unchanged.",
-                        ok,
+                        successes,
                         self.results.len(),
-                        if self.page == Page::Decrypt {
-                            "decrypted"
-                        } else {
+                        if self.operation == Operation::Encrypt {
                             "encrypted"
+                        } else {
+                            "decrypted"
                         }
                     ),
-                ));
+                );
                 if let Some(id) = self.close_requested.take() {
                     return window::close(id);
                 }
             }
+            Message::EngineDone(purpose, result) => {
+                self.finish();
+                match result {
+                    Err(e) => self.notice(true, e),
+                    Ok(mut response) => match purpose {
+                        Purpose::Text => {
+                            self.text_output =
+                                Zeroizing::new(response.text.take().unwrap_or_default());
+                            self.notice(false, "Done. Copy the result or save it as a file.");
+                        }
+                        Purpose::GeneratedKey(path) => {
+                            self.key_paths = vec![path];
+                            self.public_keys = std::mem::take(&mut response.public_keys);
+                            self.notice(false,"Identity saved. Back it up; share only the public recipient below.");
+                        }
+                        Purpose::PublicKeys(paths) => {
+                            self.key_paths = paths;
+                            self.public_keys = std::mem::take(&mut response.public_keys);
+                            self.notice(false,"Public recipients extracted. Secret identities stay in their files.");
+                        }
+                        Purpose::Inspect => self.inspection = response.metadata.take(),
+                        Purpose::Password(target) => {
+                            let value = response.text.take().unwrap_or_default();
+                            match target {
+                                SecretTarget::Key => {
+                                    self.key_confirmation = Zeroizing::new(value.clone());
+                                    self.key_password = Zeroizing::new(value);
+                                    self.key_reveal = true;
+                                }
+                                _ => {
+                                    self.confirmation = Zeroizing::new(value.clone());
+                                    self.password = Zeroizing::new(value);
+                                    self.reveal = true;
+                                }
+                            }
+                            self.notice(false,"Generated a 192-bit random passphrase. Keep a copy before encrypting.");
+                        }
+                        Purpose::Version => {
+                            self.engine_info = format!("{} · {}", response.engine, response.go)
+                        }
+                    },
+                }
+                if let Some(id) = self.close_requested.take() {
+                    return window::close(id);
+                }
+            }
+            Message::CopyPublic => return iced::clipboard::write(self.public_keys.join("\n")),
+            Message::UsePublic if !self.blocked() => {
+                self.page = Page::Encrypt;
+                self.operation = Operation::Encrypt;
+                self.recipients = shad::textarea::Content::with_text(&self.public_keys.join("\n"));
+                self.protection = Protection::Auto;
+                self.recipient_files.clear();
+                self.notice = None;
+            }
+            Message::CopyText => return iced::clipboard::write(self.text_output.to_string()),
+            Message::UseTextOutput if !self.blocked() => {
+                self.text_input = shad::textarea::Content::with_text(&self.text_output);
+                self.text_output.zeroize();
+                self.operation = if self.operation == Operation::Encrypt {
+                    Operation::Decrypt
+                } else {
+                    Operation::Encrypt
+                };
+                self.page = if self.operation == Operation::Encrypt {
+                    Page::Encrypt
+                } else {
+                    Page::Decrypt
+                };
+                self.input_mode = InputMode::Text;
+                self.notice = None;
+            }
+            Message::CopyInspection => {
+                return iced::clipboard::write(
+                    serde_json::to_string_pretty(&self.inspection).unwrap_or_default(),
+                );
+            }
+            Message::CopyCommand => return iced::clipboard::write(self.cli_preview()),
+            Message::InspectInput if !self.blocked() => {
+                let mut r = Request::new("inspect");
+                if self.input_mode == InputMode::Text {
+                    r.text = Some(self.text_input.text());
+                } else if let Some(file) = self.files.first() {
+                    r.input = file.path.to_string_lossy().into_owned();
+                    self.inspect_path = Some(file.path.clone());
+                } else {
+                    self.notice(true, "Choose an encrypted file first.");
+                    return Task::none();
+                }
+                self.page = Page::Inspect;
+                return self.launch_engine(Purpose::Inspect, r, "Inspecting the encrypted input");
+            }
+            Message::TextSaved(result) => match result {
+                Ok(()) => self.notice(false, "Saved as a new file."),
+                Err(e) => self.notice(true, e),
+            },
+            Message::CheckEngine if !self.blocked() => {
+                return self.launch_engine(
+                    Purpose::Version,
+                    Request::new("version"),
+                    "Checking the official engine",
+                );
+            }
             Message::ToggleTheme => self.dark = !self.dark,
+            Message::Renderer(value) if !self.blocked() => self.next_renderer = value,
+            Message::Restart if !self.blocked() => {
+                if let Ok(path) = std::env::current_exe() {
+                    let mut command = std::process::Command::new(path);
+                    command.arg("--renderer").arg(&self.next_renderer);
+                    if self.dark {
+                        command.arg("--dark");
+                    }
+                    match command.spawn() {
+                        Ok(_) => return window::oldest().and_then(window::close),
+                        Err(e) => self.notice(true, format!("Cannot restart: {e}")),
+                    }
+                }
+            }
             Message::Dismiss => self.notice = None,
             Message::Window(_, window::Event::FileDropped(path)) => {
                 self.hovered = false;
                 if !self.blocked() {
-                    return Task::done(Message::FilesPicked(vec![path]));
+                    let pick = if self.page == Page::Inspect {
+                        Pick::Inspect
+                    } else if self.page == Page::Keys {
+                        Pick::KeyOpen
+                    } else {
+                        Pick::Inputs
+                    };
+                    return Task::done(Message::Picked(pick, vec![path]));
                 }
             }
             Message::Window(_, window::Event::FileHovered(_)) => self.hovered = true,
@@ -471,14 +1003,14 @@ impl App {
                 if self.busy() {
                     self.close_requested = Some(id);
                 } else {
-                    self.clear_secrets();
+                    self.clear_passwords();
                     return window::close(id);
                 }
             }
             Message::Close(id) => {
                 self.close_requested = Some(id);
                 if let Some(p) = &self.progress {
-                    p.cancelled.store(true, Ordering::Relaxed);
+                    p.cancel();
                 } else {
                     return window::close(id);
                 }
@@ -505,6 +1037,8 @@ impl App {
                 }
             }
             Message::System(info) => {
+                self.graphics_info =
+                    format!("{} · {}", info.graphics_backend, info.graphics_adapter);
                 if let Some(dir) = &self.options.probe {
                     let _ = std::fs::write(
                         dir.join("renderer.txt"),
@@ -515,13 +1049,13 @@ impl App {
                     );
                 }
             }
-            Message::Captured(screenshot) => {
+            Message::Captured(s) => {
                 if let Some(dir) = &self.options.probe {
                     let _ = image::save_buffer(
                         dir.join("window.png"),
-                        &screenshot.rgba,
-                        screenshot.size.width,
-                        screenshot.size.height,
+                        &s.rgba,
+                        s.size.width,
+                        s.size.height,
                         image::ColorType::Rgba8,
                     );
                     let _ = std::fs::write(
@@ -536,827 +1070,204 @@ impl App {
             Message::ProbeExit => return window::oldest().and_then(window::close),
             _ => {}
         }
+        if previous_page != self.page || previous_mode != self.input_mode {
+            return iced::widget::operation::snap_to(
+                "workspace-scroll",
+                iced::widget::operation::RelativeOffset::START,
+            );
+        }
+        if show_result {
+            return iced::widget::operation::snap_to_end("workspace-scroll");
+        }
         Task::none()
     }
-
     fn validate(&self) -> Result<(), String> {
-        if self.files.is_empty() {
-            return Err("Choose at least one file to get started.".into());
+        if self.input_mode == InputMode::Files && self.files.is_empty() {
+            return Err("Choose at least one input file.".into());
         }
-        if self.method == Method::Passphrase {
-            if self.password.is_empty() {
-                return Err("Enter your passphrase.".into());
+        let text = self.text_input.text();
+        let limit = if self.operation == Operation::Encrypt {
+            1024 * 1024
+        } else {
+            2 * 1024 * 1024
+        };
+        if self.input_mode == InputMode::Text && (text.is_empty() || text.len() > limit) {
+            return Err(format!(
+                "Enter text up to {} MiB, or use Files for larger input.",
+                limit / (1024 * 1024)
+            ));
+        }
+        if self.operation == Operation::Encrypt {
+            if self.protection == Protection::Passphrase {
+                password_valid(&self.password, &self.confirmation)?;
+            } else if self.recipients.text().trim().is_empty()
+                && self.recipient_files.is_empty()
+                && self.identities.is_empty()
+                && self.identity_text.is_empty()
+                && self.plugin_names.trim().is_empty()
+            {
+                return Err("Add a recipient key, recipient file, identity, or plugin.".into());
             }
-            if self.page == Page::Encrypt {
-                if self.password.chars().count() < 12 {
-                    return Err(
-                        "Use at least 12 characters. A few random words make a good passphrase."
-                            .into(),
-                    );
-                }
-                if self.password != self.confirmation {
-                    return Err("The passphrases do not match.".into());
-                }
-            }
-        } else if self.page == Page::Encrypt {
-            crypto::recipients(&self.recipients.text())?;
-        } else if self.identity.is_none() {
-            return Err("Choose the secret identity file that can unlock these files.".into());
         }
         Ok(())
     }
-
-    pub fn view(&self) -> Element<'_, Message> {
-        let header = container(
-            row![
-                muted("Workspace", 12),
-                muted("/", 12),
-                text(self.page.title()).size(12).font(font::medium()),
-                space::horizontal(),
-                badge("LOCAL ONLY")
-                    .variant(shad::badge::Variant::Outline)
-                    .icon(lucide::SHIELD_CHECK),
-            ]
-            .spacing(14)
-            .align_y(Alignment::Center),
-        )
-        .padding([20, 32])
-        .width(Length::Fill)
-        .style(header_style);
-
-        let content = match self.page {
-            Page::Keys => self.keys_view(),
-            Page::Guide => self.guide_view(),
-            _ => self.workspace_view(),
+    fn start(&mut self) -> Task<Message> {
+        if let Err(e) = self.validate() {
+            self.notice(true, e);
+            return Task::none();
+        }
+        let mut r = match self.request(self.operation.name()) {
+            Ok(r) => r,
+            Err(e) => {
+                self.notice(true, e);
+                return Task::none();
+            }
         };
-        let main = column![
-            header,
-            scrollable(container(content).padding([30, 32]).width(Length::Fill))
-                .height(Length::Fill)
-        ]
-        .width(Length::Fill);
-        let shell = row![self.sidebar(), main].height(Length::Fill);
-        let base: Element<'_, Message> = container(shell)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(background_style)
-            .into();
-        if let Some(id) = self.close_requested {
-            return tab_order(shad::dialog::dialog(base, true).on_close(Message::Stay)
-                .title("An operation is still running")
-                .description("You can stay here, or cancel the operation and close once the current file has been cleaned up. Files already completed are kept.")
-                .content(row![button("Keep working").variant(shad::button::Variant::Outline).on_press(Message::Stay), button("Cancel and close").on_press(Message::Close(id))].spacing(8))
-            ).into();
+        self.password.zeroize();
+        self.confirmation.zeroize();
+        self.reveal = false;
+        self.results.clear();
+        if self.input_mode == InputMode::Text {
+            r.text = Some(self.text_input.text());
+            return self.launch_engine(Purpose::Text, r, "Processing your text");
         }
-        // Capture app shortcuts before a focused button consumes Enter. The
-        // subscription only handles uncaptured keys (e.g. before initial focus).
-        shad::primitive::keys(tab_order(base), shortcut).into()
-    }
-
-    fn sidebar(&self) -> Element<'_, Message> {
-        let logo = row![
-            container(lucide::LOCK_KEYHOLE.sized(20).color(Color::WHITE))
-                .padding(10)
-                .style(|_| container::Style {
-                    background: Some(Background::Color(Color::from_rgb8(24, 24, 27))),
-                    border: Border {
-                        radius: 11.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }),
-            column![
-                text("age").size(26).font(font::semibold()),
-                muted("FILE ENCRYPTION", 9)
-            ]
-            .spacing(0)
-        ]
-        .spacing(11)
-        .align_y(Alignment::Center);
-        let nav = column![
-            nav_item(
-                "Encrypt",
-                lucide::LOCK_KEYHOLE,
-                Page::Encrypt,
-                self.page,
-                self.blocked()
-            ),
-            nav_item(
-                "Decrypt",
-                lucide::LOCK_KEYHOLE_OPEN,
-                Page::Decrypt,
-                self.page,
-                self.blocked()
-            ),
-            nav_item(
-                "Your keys",
-                lucide::KEY_ROUND,
-                Page::Keys,
-                self.page,
-                self.blocked()
-            ),
-        ]
-        .spacing(6);
-        let bottom = column![
-            nav_item(
-                "How it works",
-                lucide::BOOK_OPEN,
-                Page::Guide,
-                self.page,
-                self.blocked()
-            ),
-            button(if self.dark {
-                "Light appearance"
-            } else {
-                "Dark appearance"
-            })
-            .icon(if self.dark { lucide::SUN } else { lucide::MOON })
-            .variant(shad::button::Variant::Ghost)
-            .width(Length::Fill)
-            .on_press(Message::ToggleTheme),
-            space::vertical().height(14),
-            row![
-                text("●").size(10).color(Color::from_rgb8(34, 140, 93)),
-                muted("Everything stays here", 11)
-            ]
-            .spacing(7)
-            .align_y(Alignment::Center),
-            muted("age desktop  /  0.1.0", 10),
-        ]
-        .spacing(8);
-        container(
-            column![
-                logo,
-                space::vertical().height(40),
-                muted("WORKSPACE", 10),
-                nav,
-                space::vertical(),
-                bottom
-            ]
-            .spacing(12),
-        )
-        .padding([28, 18])
-        .width(210)
-        .height(Length::Fill)
-        .style(sidebar_style)
-        .into()
-    }
-
-    fn workspace_view(&self) -> Element<'_, Message> {
-        let decrypting = self.page == Page::Decrypt;
-        let heading = column![
-            text(if decrypting {
-                "Back in your hands."
-            } else {
-                "Keep it between you."
-            })
-            .font(font::semibold())
-            .size(30),
-            muted(
-                if decrypting {
-                    "Unlock your files with a secret identity or passphrase."
-                } else {
-                    "Simple, secure file encryption. Yours to keep. Yours to share."
-                },
-                14
-            ),
-        ]
-        .spacing(8);
-        let left = column![self.file_card(), self.output_card()]
-            .spacing(18)
-            .width(Length::FillPortion(6));
-        let right = column![self.protection_card(), self.reassurance()]
-            .spacing(18)
-            .width(Length::FillPortion(5));
-        let mut body = column![heading, row![left, right].spacing(22)].spacing(26);
-        if let Some((error, notice)) = &self.notice {
-            body = body.push(
-                alert(if *error {
-                    "A little attention needed"
-                } else {
-                    "All set"
-                })
-                .description(notice.clone())
-                .icon(if *error {
-                    lucide::CIRCLE_ALERT
-                } else {
-                    lucide::CIRCLE_CHECK
-                })
-                .variant(if *error {
-                    shad::alert::Variant::Destructive
-                } else {
-                    shad::alert::Variant::Default
-                })
-                .action(
-                    icon_button(lucide::X)
-                        .size(shad::button::Size::IconXs)
-                        .variant(shad::button::Variant::Ghost)
-                        .on_press(Message::Dismiss),
-                ),
-            );
-        }
-        body = body.push(self.action_bar());
-        if !self.results.is_empty() {
-            body = body.push(self.results_view());
-        }
-        body.into()
-    }
-
-    fn file_card(&self) -> Element<'_, Message> {
-        let mut card = card()
-            .title("01   Choose your files")
-            .description("Drop files anywhere in this window.")
-            .action(badge(self.files.len().to_string()).variant(shad::badge::Variant::Secondary));
-        if self.files.is_empty() {
-            let drop = column![
-                container(lucide::FILES.sized(28))
-                    .padding(10)
-                    .style(icon_tile_style),
-                text(if self.hovered {
-                    "Release to add your files"
-                } else {
-                    "A safe place to drop your files"
-                })
-                .size(14)
-                .font(font::medium()),
-                muted(
-                    if self.page == Page::Decrypt {
-                        "Binary .age or armored files"
-                    } else {
-                        "Documents, photos, archives, anything."
-                    },
-                    12
-                ),
-                button("Browse files")
-                    .icon(lucide::PLUS)
-                    .variant(shad::button::Variant::Outline)
-                    .on_press_maybe((!self.blocked()).then_some(Message::PickFiles)),
-            ]
-            .spacing(9)
-            .align_x(Alignment::Center);
-            card = card.content(
-                container(drop)
-                    .center_x(Length::Fill)
-                    .padding([16, 10])
-                    .style(drop_style),
-            );
+        let job = Job {
+            operation: self.operation,
+            inputs: self.files.iter().map(|f| f.path.clone()).collect(),
+            output_dir: self.output_dir.clone(),
+            output_file: self.output_file.clone(),
+            overwrite: self.overwrite,
+            request: r,
+        };
+        let p = self.progress(if self.operation == Operation::Encrypt {
+            "Encrypting your files"
         } else {
-            let mut files = column![].spacing(4);
-            for (i, file) in self.files.iter().enumerate() {
-                files = files.push(
-                    container(
-                        row![
-                            container(lucide::FILE.sized(18))
-                                .padding(9)
-                                .style(icon_tile_style),
-                            column![
-                                text(filename(&file.path)).size(12).font(font::medium()),
-                                muted(format_size(file.size), 11)
-                            ]
-                            .spacing(3)
-                            .width(Length::Fill),
-                            icon_button(lucide::X)
-                                .size(shad::button::Size::IconSm)
-                                .variant(shad::button::Variant::Ghost)
-                                .on_press_maybe(
-                                    (!self.blocked()).then_some(Message::RemoveFile(i))
-                                ),
-                        ]
-                        .spacing(12)
-                        .align_y(Alignment::Center),
-                    )
-                    .padding([8, 0]),
-                );
-            }
-            card = card
-                .content(scrollable(files).height((self.files.len() as f32 * 58.0).min(190.0)))
-                .content(
-                    row![
-                        button("Add files")
-                            .icon(lucide::PLUS)
-                            .variant(shad::button::Variant::Outline)
-                            .on_press_maybe((!self.blocked()).then_some(Message::PickFiles)),
-                        space::horizontal(),
-                        button("Clear")
-                            .variant(shad::button::Variant::Ghost)
-                            .on_press_maybe((!self.blocked()).then_some(Message::ClearFiles)),
-                    ]
-                    .align_y(Alignment::Center),
-                );
-        }
-        card.footer(
-            row![
-                lucide::HARD_DRIVE.sized(13),
-                muted(
-                    if self.files.is_empty() {
-                        "Files are never uploaded  ·  Ctrl + O to browse".into()
-                    } else {
-                        format!(
-                            "{} files  ·  {}",
-                            self.files.len(),
-                            format_size(self.total_size())
-                        )
-                    },
-                    11
-                )
-            ]
-            .spacing(7)
-            .align_y(Alignment::Center),
-        )
-        .into()
-    }
-
-    fn output_card(&self) -> Element<'_, Message> {
-        let location = self
-            .output
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "Next to the original files".into());
-        let mut card = card().title("03   Save a new copy").content(
-            column![
-                row![
-                    lucide::FOLDER_OPEN.sized(16),
-                    text(location).size(12).width(Length::Fill)
-                ]
-                .spacing(9),
-                row![
-                    button("Change folder")
-                        .variant(shad::button::Variant::Outline)
-                        .size(shad::button::Size::Sm)
-                        .on_press_maybe((!self.blocked()).then_some(Message::PickOutput)),
-                    button("Reset")
-                        .variant(shad::button::Variant::Ghost)
-                        .size(shad::button::Size::Sm)
-                        .on_press_maybe(
-                            (!self.blocked() && self.output.is_some())
-                                .then_some(Message::ResetOutput)
-                        )
-                ]
-                .spacing(8),
-            ]
-            .spacing(12),
-        );
-        if self.page == Page::Encrypt {
-            card = card.content(
-                field(
-                    "Text-friendly output",
-                    switch(self.armor)
-                        .on_toggle(Message::Armor)
-                        .disabled(self.blocked()),
-                )
-                .description("ASCII armor for copying into messages.")
-                .orientation(shad::field::Orientation::Responsive),
-            );
-        } else {
-            card = card.content(muted("Existing files are never overwritten. Choose a new folder if the original is still there.", 12));
-        }
-        card.into()
-    }
-
-    fn protection_card(&self) -> Element<'_, Message> {
-        let encrypting = self.page == Page::Encrypt;
-        let tabs = tabs(self.method, Message::Method)
-            .tab_with_icon(
-                Method::Key,
-                lucide::KEY_ROUND,
-                if encrypting {
-                    "Recipient"
-                } else {
-                    "Identity file"
-                },
-            )
-            .tab_with_icon(Method::Passphrase, lucide::ASTERISK, "Passphrase")
-            .width(Length::Fill);
-        let mut fields = column![tabs].spacing(18);
-        if self.method == Method::Key && encrypting {
-            let value = self.recipients.text();
-            let count = crypto::recipients(&value).map(|r| r.len()).ok();
-            // The upstream shadcn textarea currently exposes only word wrapping.
-            // age keys have no spaces, so use its style on Iced's editor with a
-            // glyph fallback to keep the complete key inside narrow layouts.
-            let input = widget::text_editor(&self.recipients)
-                .placeholder("age1…\n\nOne public key per line")
-                .height(118)
-                .size(12)
-                .font(font::mono())
-                .padding([9, 11])
-                .wrapping(text::Wrapping::WordOrGlyph)
-                .style(|theme, status| shad::textarea::style(theme, status, false));
-            fields = fields.push(
-                field(
-                    "Recipient public keys",
-                    if self.blocked() {
-                        input
-                    } else {
-                        input.on_action(Message::Recipients)
-                    },
-                )
-                .description("One age1 public key per recipient."),
-            );
-            fields = fields.push(if let Some(n) = count {
-                row![
-                    lucide::CHECK.sized(13),
-                    muted(
-                        format!("{n} valid recipient{}", if n == 1 { "" } else { "s" }),
-                        12
-                    )
-                ]
-                .spacing(7)
-            } else {
-                row![
-                    lucide::INFO.sized(13),
-                    muted("Only these recipients can unlock the files.", 12)
-                ]
-                .spacing(7)
-            });
-            fields = fields.push(
-                button("Need a key? Create one")
-                    .variant(shad::button::Variant::Link)
-                    .size(shad::button::Size::Sm)
-                    .on_press_maybe((!self.blocked()).then_some(Message::Navigate(Page::Keys))),
-            );
-        } else if self.method == Method::Key {
-            fields = fields.push(
-                field(
-                    "Your secret identity",
-                    column![
-                        muted(
-                            self.identity
-                                .as_ref()
-                                .map(|p| filename(p))
-                                .unwrap_or_else(|| "No identity selected".into()),
-                            13
-                        ),
-                        button("Choose identity file")
-                            .icon(lucide::KEY_ROUND)
-                            .variant(shad::button::Variant::Outline)
-                            .on_press_maybe((!self.blocked()).then_some(Message::PickIdentity)),
-                    ]
-                    .spacing(12),
-                )
-                .description("A plain age X25519 identity file, usually saved as .txt or .agekey."),
-            );
-        } else {
-            fields = fields.push(field(
-                "Passphrase",
-                input("Enter your passphrase", &self.password)
-                    .secure(!self.reveal)
-                    .on_input_maybe(
-                        (!self.blocked()).then_some(|s| Message::Password(Zeroizing::new(s))),
-                    ),
-            ));
-            if encrypting {
-                fields = fields.push(
-                    field(
-                        "Confirm passphrase",
-                        input("Enter it once more", &self.confirmation)
-                            .secure(!self.reveal)
-                            .on_input_maybe(
-                                (!self.blocked())
-                                    .then_some(|s| Message::Confirm(Zeroizing::new(s))),
-                            ),
-                    )
-                    .description("At least 12 characters. Try a few random words."),
-                );
-            }
-            fields = fields.push(
-                button(if self.reveal {
-                    "Hide passphrase"
-                } else {
-                    "Show passphrase"
-                })
-                .icon(if self.reveal {
-                    lucide::EYE_OFF
-                } else {
-                    lucide::EYE
-                })
-                .variant(shad::button::Variant::Ghost)
-                .size(shad::button::Size::Sm)
-                .on_press(Message::Reveal),
-            );
-        }
-        card()
-            .title(if encrypting {
-                "02   Who can open them?"
-            } else {
-                "02   Unlock your files"
-            })
-            .description(if encrypting {
-                "Choose how to protect your files."
-            } else {
-                "Use the key or passphrase used to encrypt."
-            })
-            .content(fields)
-            .into()
-    }
-
-    fn reassurance(&self) -> Element<'_, Message> {
-        container(
-            row![
-                lucide::SHIELD_CHECK.sized(18),
-                column![
-                    text("Private by design").size(13).font(font::medium()),
-                    muted(
-                        "Encryption happens on your device. No accounts. No uploads. No tracking.",
-                        12
-                    ),
-                ]
-                .spacing(7)
-            ]
-            .spacing(12),
-        )
-        .padding(17)
-        .width(Length::Fill)
-        .style(soft_style)
-        .into()
-    }
-
-    fn action_bar(&self) -> Element<'_, Message> {
-        if let Some(p) = &self.progress {
-            let cancelling = p.cancelled.load(Ordering::Relaxed);
-            let percent = (p.bytes.load(Ordering::Relaxed) as f64 / self.total_size().max(1) as f64
-                * 100.0)
-                .min(99.0) as f32;
-            return column![
-                row![
-                    text(if cancelling {
-                        "Cancelling safely…"
-                    } else {
-                        "Working on your files…"
+            "Decrypting your files"
+        });
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || crypto::run(job, p))
+                    .await
+                    .unwrap_or_else(|_| {
+                        vec![FileResult {
+                            input: PathBuf::from("Operation"),
+                            output: None,
+                            error: Some("File worker stopped unexpectedly.".into()),
+                        }]
                     })
-                    .size(13)
-                    .font(font::medium()),
-                    space::horizontal(),
-                    button("Cancel")
-                        .variant(shad::button::Variant::Outline)
-                        .on_press_maybe((!cancelling).then_some(Message::Cancel))
-                ]
-                .align_y(Alignment::Center),
-                progress(percent)
-            ]
-            .spacing(12)
-            .into();
-        }
-        row![
-            column![
-                text("Your originals stay untouched.")
-                    .size(13)
-                    .font(font::medium()),
-                muted("A separate copy. A little more peace of mind.", 12)
-            ]
-            .spacing(5),
-            space::horizontal(),
-            button(if self.page == Page::Encrypt {
-                "Encrypt files"
-            } else {
-                "Decrypt files"
-            })
-            .icon(if self.page == Page::Encrypt {
-                lucide::LOCK_KEYHOLE
-            } else {
-                lucide::LOCK_KEYHOLE_OPEN
-            })
-            .size(shad::button::Size::Lg)
-            .disabled(self.files.is_empty() || self.blocked())
-            .on_press_maybe((!self.files.is_empty() && !self.blocked()).then_some(Message::Start)),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center)
-        .into()
+            },
+            Message::Finished,
+        )
     }
-
-    fn results_view(&self) -> Element<'_, Message> {
-        let mut results = column![].spacing(14);
-        for result in &self.results {
-            let detail = result
-                .output
-                .as_ref()
-                .map(|p| format!("Saved to {}", p.display()))
-                .unwrap_or_else(|| result.error.clone().unwrap_or_default());
-            results = results.push(
-                row![
-                    if result.output.is_some() {
-                        lucide::CIRCLE_CHECK
-                            .sized(16)
-                            .color(Color::from_rgb8(34, 140, 93))
-                    } else {
-                        lucide::CIRCLE_ALERT
-                            .sized(16)
-                            .color(Color::from_rgb8(220, 60, 60))
-                    },
-                    column![
-                        text(filename(&result.input)).size(13).font(font::medium()),
-                        muted(detail, 12)
-                    ]
-                    .spacing(4),
-                ]
-                .spacing(10),
-            );
-        }
-        card()
-            .title("Results")
-            .description("This list is kept only for the current session.")
-            .content(results)
-            .into()
-    }
-
-    fn keys_view(&self) -> Element<'_, Message> {
-        let mut body = column![
-            text("One key. Only yours.").size(30).font(font::semibold()),
-            muted("Create an identity to receive encrypted files, or open one you already have.", 14),
-            space::vertical().height(10),
-            card().title("A key with two sides").description("Share the public key. Keep the secret identity file private.")
-                .content(row![
-                    key_explainer(lucide::SEND, "Public key", "Give this to someone who wants to send you a file. It starts with age1."),
-                    key_explainer(lucide::KEY_ROUND, "Secret identity", "This file unlocks your encrypted files. Back it up somewhere only you can access."),
-                ].spacing(28))
-                .footer(row![button("Create a new identity").icon(lucide::PLUS).on_press_maybe((!self.blocked()).then_some(Message::GenerateKey)),
-                    button("Open an existing identity").icon(lucide::FOLDER_OPEN).variant(shad::button::Variant::Outline).on_press_maybe((!self.blocked()).then_some(Message::PickIdentity))].spacing(10)),
-        ].spacing(14);
-        if !self.public_keys.is_empty() {
-            let mut keys = column![].spacing(10);
-            for key in &self.public_keys {
-                keys = keys.push(text(key.clone()).size(12).font(font::mono()));
+    fn cli_preview(&self) -> String {
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let mut args = vec![
+            "age".to_owned(),
+            if self.operation == Operation::Encrypt {
+                "--encrypt"
+            } else {
+                "--decrypt"
             }
-            body = body.push(
-                card()
-                    .title("Your public key")
-                    .description("Safe to copy and share.")
-                    .content(keys)
-                    .content(muted(
-                        format!(
-                            "Identity file: {}",
-                            self.identity.as_ref().unwrap().display()
-                        ),
-                        12,
-                    ))
-                    .footer(
-                        row![
-                            button("Copy public key")
-                                .icon(lucide::COPY)
-                                .on_press(Message::CopyPublic),
-                            button("Encrypt to myself")
-                                .variant(shad::button::Variant::Outline)
-                                .on_press(Message::UsePublic)
-                        ]
-                        .spacing(10),
-                    ),
+            .into(),
+        ];
+        if self.operation == Operation::Encrypt && self.protection == Protection::Passphrase {
+            args.push("--passphrase".into());
+        } else {
+            if self.operation == Operation::Encrypt {
+                for rec in self
+                    .recipients
+                    .text()
+                    .lines()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && !s.starts_with('#'))
+                {
+                    args.extend(["--recipient".into(), quote(rec)]);
+                }
+                for p in &self.recipient_files {
+                    args.extend(["--recipients-file".into(), quote(&p.display().to_string())]);
+                }
+            }
+            for p in &self.identities {
+                args.extend(["--identity".into(), quote(&p.display().to_string())]);
+            }
+            for name in self
+                .plugin_names
+                .split([',', ' ', '\n'])
+                .filter(|s| !s.is_empty())
+            {
+                args.extend(["-j".into(), quote(name)]);
+            }
+            if !self.identity_text.is_empty() {
+                args.extend(["--identity".into(), "<pasted-identity-file>".into()]);
+            }
+        }
+        if self.operation == Operation::Encrypt
+            && (self.armor || self.input_mode == InputMode::Text)
+        {
+            args.push("--armor".into());
+        }
+        if let Some(file) = self
+            .files
+            .first()
+            .filter(|_| self.input_mode == InputMode::Files)
+        {
+            if let Some(output) = self.output_file.clone().or_else(|| {
+                crypto::output_path(
+                    &file.path,
+                    self.output_dir.as_deref(),
+                    self.operation,
+                    self.armor,
+                )
+                .ok()
+            }) {
+                args.extend(["--output".into(), quote(&output.display().to_string())]);
+            }
+            args.push(quote(&file.path.display().to_string()));
+        } else {
+            args.push(
+                if self.operation == Operation::Encrypt {
+                    "'<plaintext-file>'"
+                } else {
+                    "'<armored-file>'"
+                }
+                .into(),
             );
         }
-        if let Some((error, notice)) = &self.notice {
-            body = body.push(
-                alert(if *error {
-                    "Could not open the key"
-                } else {
-                    "Ready"
-                })
-                .description(notice.clone())
-                .variant(if *error {
-                    shad::alert::Variant::Destructive
-                } else {
-                    shad::alert::Variant::Default
-                }),
-            );
+        args.join(" ")
+    }
+}
+fn password_valid(value: &str, confirm: &str) -> Result<(), String> {
+    if value.chars().count() < 12 {
+        return Err("Use at least 12 characters, or generate a secure passphrase.".into());
+    }
+    if value != confirm {
+        return Err("The two passphrases do not match.".into());
+    }
+    Ok(())
+}
+fn append_unique(target: &mut Vec<PathBuf>, paths: Vec<PathBuf>) {
+    for p in paths {
+        if !target.contains(&p) {
+            target.push(p);
         }
-        body.push(self.reassurance()).into()
-    }
-
-    fn guide_view(&self) -> Element<'_, Message> {
-        column![
-            text("A little peace of mind.").size(30).font(font::semibold()),
-            muted("A native desktop companion for the open age encryption format.", 14),
-            space::vertical().height(10),
-            card().title("Sending a file").content(muted("Ask the recipient for their public key. Add your files in Encrypt, paste the public key, and encrypt. Share the new .age files however you like. Add your own public key too if you want to decrypt them later.", 14)),
-            card().title("Using a passphrase").content(muted("Choose a strong passphrase, then send it through a different channel from the encrypted file. You will need the exact same passphrase to decrypt. There is no password reset.", 14)),
-            card().title("What this version supports").content(muted("X25519 age recipients and identities, passphrases, multiple files, and ASCII armor. SSH keys, encrypted identity files, plugins, and post-quantum keys are not supported yet. Archive folders before encrypting them.", 14)),
-            card().title("Made to stay local").content(muted("Built with Rust, Iced, shadcn-iced, and the age library from rage. Files and passphrases are never sent over a network. Secret identities are saved only to a location you choose. This app has not undergone an independent security audit.", 14))
-                .footer(muted("age desktop is an independent project; it is not an official age application.", 12)),
-            row![badge("Native Rust").variant(shad::badge::Variant::Outline), badge("CPU + GPU rendering").variant(shad::badge::Variant::Outline), badge("age format").variant(shad::badge::Variant::Outline)].spacing(8),
-        ].spacing(16).into()
     }
 }
-
-fn shortcut(key: &iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> Option<Message> {
-    if !modifiers.command() {
-        return None;
-    }
-    match key.as_ref() {
-        iced::keyboard::Key::Character("o") => Some(Message::PickFiles),
-        iced::keyboard::Key::Character("1") => Some(Message::Navigate(Page::Encrypt)),
-        iced::keyboard::Key::Character("2") => Some(Message::Navigate(Page::Decrypt)),
-        iced::keyboard::Key::Character("3") => Some(Message::Navigate(Page::Keys)),
-        iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) => Some(Message::Start),
-        _ => None,
-    }
-}
-
 fn filename(path: &Path) -> String {
     path.file_name()
         .unwrap_or(path.as_os_str())
         .to_string_lossy()
         .into_owned()
 }
-fn format_size(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+fn shortcut(key: &iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> Option<Message> {
+    if !modifiers.command() {
+        return None;
     }
-}
-fn muted<'a>(value: impl text::IntoFragment<'a>, size: u32) -> widget::Text<'a> {
-    text(value)
-        .size(size)
-        .wrapping(text::Wrapping::WordOrGlyph)
-        .style(|t: &Theme| text::Style {
-            color: Some(tokens(t).palette.muted_foreground),
-        })
-}
-fn nav_item(
-    label: &str,
-    icon: shad::Icon,
-    page: Page,
-    current: Page,
-    disabled: bool,
-) -> Element<'_, Message> {
-    shad::button::Button::new(
-        row![icon.sized(16), text(label).size(14).font(font::medium())]
-            .spacing(10)
-            .width(Length::Fill),
-    )
-    .size(shad::button::Size::Lg)
-    .width(Length::Fill)
-    .variant(if page == current {
-        shad::button::Variant::Secondary
-    } else {
-        shad::button::Variant::Ghost
-    })
-    .on_press_maybe((!disabled).then_some(Message::Navigate(page)))
-    .into()
-}
-fn key_explainer(
-    icon: shad::Icon,
-    title: &'static str,
-    description: &'static str,
-) -> Element<'static, Message> {
-    column![
-        container(icon.sized(22)).padding(12).style(icon_tile_style),
-        text(title).size(15).font(font::medium()),
-        muted(description, 13)
-    ]
-    .spacing(12)
-    .width(Length::Fill)
-    .into()
-}
-fn background_style(t: &Theme) -> container::Style {
-    let p = tokens(t).palette;
-    container::Style {
-        background: Some(p.background.into()),
-        text_color: Some(p.foreground),
-        ..Default::default()
-    }
-}
-fn sidebar_style(t: &Theme) -> container::Style {
-    let p = tokens(t).palette;
-    container::Style {
-        background: Some(p.card.into()),
-        border: Border {
-            color: p.border,
-            width: 1.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    }
-}
-fn header_style(t: &Theme) -> container::Style {
-    sidebar_style(t)
-}
-fn icon_tile_style(t: &Theme) -> container::Style {
-    let p = tokens(t).palette;
-    container::Style {
-        background: Some(p.muted.into()),
-        border: Border {
-            radius: 10.0.into(),
-            ..Default::default()
-        },
-        ..Default::default()
-    }
-}
-fn soft_style(t: &Theme) -> container::Style {
-    icon_tile_style(t)
-}
-fn drop_style(t: &Theme) -> container::Style {
-    let p = tokens(t).palette;
-    container::Style {
-        background: Some(p.background.into()),
-        border: Border {
-            radius: 9.0.into(),
-            color: p.border,
-            width: 1.0,
-        },
-        ..Default::default()
+    match key.as_ref() {
+        iced::keyboard::Key::Character("o") => Some(Message::Pick(Pick::Inputs)),
+        iced::keyboard::Key::Character("1") => Some(Message::Navigate(Page::Encrypt)),
+        iced::keyboard::Key::Character("2") => Some(Message::Navigate(Page::Decrypt)),
+        iced::keyboard::Key::Character("3") => Some(Message::Navigate(Page::Keys)),
+        iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) => Some(Message::Start),
+        _ => None,
     }
 }

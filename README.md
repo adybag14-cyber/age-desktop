@@ -1,79 +1,81 @@
 # age desktop
 
-A native Rust desktop companion for [age](https://github.com/FiloSottile/age), with actual **shadcn-iced** components, Geist typography, Lucide icons, light/dark themes, and CPU/GPU rendering. The application uses the Rust `age` library from [rage](https://github.com/str4d/rage) directly.
+A native **Rust + shadcn-iced** desktop interface for the official [age encryption format](https://github.com/FiloSottile/age). Version **0.2.0** brings current age workflows into a graphical interface: post-quantum and classic keys, SSH, passphrases, plugins, protected identities, text encryption, and inspection.
 
-![age desktop in the light theme](docs/screenshots/light.png)
+![age desktop](docs/screenshots/light.png)
 
-[Dark theme screenshot](docs/screenshots/dark.png)
+## What you can do
 
-## Run
+- **Choose protection:** Post-quantum ML-KEM-768 + X25519, Classic X25519, Passphrase/scrypt, SSH Ed25519/RSA, Plugin/hardware, or automatic detection from recipient keys. Age's payload cipher remains ChaCha20-Poly1305.
+- **Combine key sources:** paste recipients, import multiple recipient files, include your own identities, or supply a documented `-j` plugin name.
+- **Unlock more identities:** multiple native/PQ/SSH files, encrypted age identities, encrypted SSH private keys, and pasted identities. Passwords and plugin PINs appear as masked prompts.
+- **Encrypt files or text:** multiple files with streaming I/O; UTF-8 Text & clipboard with copy/save and automatic ASCII armor.
+- **Choose output:** a folder for a batch or an explicit filename for one file. Optional output replacement has a confirmation dialog and protects selected input/key files.
+- **Create and export keys:** classic or post-quantum identities, optional passphrase protection, public-recipient extraction and recipient-file export.
+- **Inspect:** see the official age-inspect metadata without decrypting, and export its JSON. Inspection does not authenticate the ciphertext.
+- **Use native graphics:** CPU software rendering, automatic GPU rendering with CPU fallback, or explicit GPU mode. Light and dark themes, native file dialogs, and keyboard controls.
 
-On Windows, open `dist/age-desktop.exe` after building or use the portable ZIP. There is no installer, account, service, browser runtime, or separate age CLI requirement.
+See the complete [CLI-to-GUI mapping](docs/cli-parity.md), [validation](docs/validation.md), and [dependency review](docs/dependency-review.md).
+
+## Run the portable app
+
+Keep the entire Windows package together and run `age-desktop.exe`. The package contains the Rust UI, a local engine adapter, the official inspector, and age's PQ/tag compatibility plugins. Go, Rust, a browser runtime, and a separate age installation are not required on the destination machine.
+
+The interface launches independently of the encryption engine. The engine starts only when needed for an operation and exits afterward.
 
 ```powershell
-cargo run --release --locked
-cargo run --release --locked -- --renderer cpu
-cargo run --release --locked -- --renderer gpu
-cargo run --release --locked -- --dark
+.\age-desktop.exe
+.\age-desktop.exe --renderer cpu
+.\age-desktop.exe --renderer gpu --dark
+.\age-desktop.exe --decrypt 'C:\path\to\document.age'
+.\age-desktop.exe --page keys
 ```
 
-`auto` is the default: Iced attempts wgpu and falls back to tiny-skia if GPU initialization fails. `--renderer cpu` selects real software rendering directly, avoiding GPU initialization. `--renderer gpu` requests wgpu only and is useful for verifying acceleration. `ICED_BACKEND` is also honored in auto mode.
+Default `auto` uses Iced's wgpu renderer and falls back to tiny-skia if initialization fails. `cpu` bypasses GPU initialization for the quickest launch. `gpu` requests the hardware renderer only. `ICED_BACKEND` and `WGPU_BACKEND` can also be used for renderer diagnostics. Tools & settings offers a rendering-mode selector with a session restart.
 
-Pass file paths after `--` to preselect them. The app otherwise starts empty and stores no history or preferences.
+Keyboard: **Tab / Shift+Tab** move focus, **Ctrl+O** selects files, **Ctrl+Enter** starts the current operation, and **Ctrl+1 / 2 / 3** select Encrypt / Decrypt / Keys.
 
-## Workflows
+## Build from source on Windows
 
-- **Encrypt:** choose or drop one or more files, paste recipient public keys (one per line), choose an output folder, and encrypt. Or choose Passphrase and confirm a passphrase of at least 12 characters. ASCII armor is optional.
-- **Decrypt:** choose the encrypted files, select your plain X25519 identity file or enter the passphrase, choose an output folder, and decrypt. Binary and armored input are detected automatically.
-- **Your keys:** generate an X25519 identity directly into a file you choose, or open an existing plain age identity file. Only public keys are displayed and copied. “Encrypt to myself” fills in your public key.
-- **Keyboard:** Tab / Shift+Tab move focus; Ctrl+O opens files; Ctrl+Enter starts the operation; Ctrl+1, Ctrl+2, Ctrl+3 select Encrypt, Decrypt, and Keys.
-
-Files are processed independently. Successful files remain saved if another file fails or the batch is cancelled. Each result displays its exact output path or error. Existing output files are never replaced, including when decrypting alongside a still-present original. Choose a different folder in that case.
-
-## Implementation
-
-| Layer | Choice | Reason |
-|---|---|---|
-| Desktop UI | Iced 0.14.0 | Native Rust widgets; both software and hardware renderers |
-| Components | shadcn-iced 0.3.0 | Native shadcn components, semantic tokens, keyboard focus, Geist and Lucide |
-| CPU graphics | tiny-skia | Actual software rasterization with no GPU requirement |
-| GPU graphics | wgpu | Direct3D 12, Vulkan, or Metal through Iced |
-| Encryption | age 0.11.5 from rage | Established age-format implementation rather than custom cryptography |
-| File dialogs | rfd | Native open/save/folder dialogs |
-| Work execution | Tokio blocking workers | File I/O and password derivation stay off the GUI thread |
-
-See [the library comparison](docs/library-selection.md) and [validation results](docs/validation.md).
-
-Rendering is event-driven while idle. There is no permanent animation loop or timer; the 100 ms progress subscription exists only while a file job is running. Release builds use optimization and thin LTO. The application streams through a 64 KiB zeroizing copy buffer rather than reading entire files into RAM. Passphrase derivation has its own intentional memory/CPU cost, set by the age library.
-
-Output is written to a temporary file beside the destination, finalized and authenticated, flushed, and then published without overwriting an existing path. Ordinary failures and cancellation remove the temporary file. Crashes or forced termination may leave temporary files; deletion is not secure erasure. Passphrases and identity text use zeroizing storage where controlled by the application; GUI libraries and the operating system can retain copies. Secret identities are ordinary unencrypted files and need a protected location and backup.
-
-Secret identity files and decrypted temporary files are restricted before any secret data is written: mode 0600 on Unix, and an explicit protected owner/SYSTEM DACL on Windows. A Windows filesystem that cannot enforce that restriction is rejected for these outputs.
-
-The classic-format age 0.11.5 patch was released alongside 0.12.1 with the same armor-parser fixes. This application intentionally excludes SSH/RSA and the newer P-256/HPKE recipient stack. The dependency report in [validation](docs/validation.md) distinguishes vulnerability findings from remaining upstream maintenance and panic-safety warnings.
-
-## Supported scope
-
-This version supports X25519 age public recipients and private identities, password encryption, multiple recipients, multiple files, and ASCII armor. It does not implement SSH keys, encrypted identity files, plugins/hardware tokens, post-quantum identities, directories/archives, or an OS key vault.
-
-This is an independent application, not an official age release. The UI and file-handling integration have not had an independent security audit. Windows is the locally tested platform; portable Rust source does not establish macOS/Linux runtime qualification.
-
-## Validate and package
+Requirements: Rust 1.88+ with the MSVC toolchain, Visual Studio C++ build tools, and Go with automatic toolchain downloads enabled. `engine/go.mod` pins **Go 1.27.3**, official **age 1.3.2**, and the dependency graph is recorded in `go.sum` and `Cargo.lock`.
 
 ```powershell
+.\scripts\build.ps1
+.\target\release\age-desktop.exe --renderer cpu
+
+# Build the synthetic plugin fixture and run both test suites
+.\scripts\build.ps1 -Test
+
+# Optional reference CLI interoperability tests
+$env:AGE_REFERENCE_BIN = 'C:\path\to\official\age.exe'
+Push-Location engine
+go test -count=1 ./...
+Pop-Location
+
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --release --locked
-
-# Optional: official reference age binary interoperability, in both directions
-$env:AGE_REFERENCE_BIN = 'C:\path\to\official\age.exe'
-cargo test --release --locked --test crypto official_go_age_interoperability -- --ignored
-
-cargo build --release --locked
 .\scripts\benchmark.ps1 -Runs 3
-.\scripts\package.ps1
+.\scripts\package.ps1 -SkipBuild
 ```
 
-`--probe <directory>` is an explicit diagnostic option: it records a screenshot, the selected renderer, startup timing, and then closes. Normal launches do not write diagnostic files. Probe timing begins at Rust `main` and records the first redraw event; the script also measures process launch to observation of that event. It does not flush OS disk caches and must not be presented as a cold-disk benchmark.
+The package script stages each version in its own `dist/<version>` directory and refuses to replace an existing versioned ZIP. The synthetic test plugin is never packaged.
 
-The package script collects dependency license files and font/icon notices alongside the executable. Application source is BSD-3-Clause licensed; dependencies retain their own licenses.
+## Architecture and file handling
+
+The GUI, component tree, file-selection state, output safeguards, and process supervisor are Rust. The narrow Go adapter uses the official age library for encryption/key parsing and the official `age-inspect` executable for metadata. No cryptographic algorithms are implemented in the desktop project. `golang.org/x/crypto` is pinned to 0.56.0 to include the SSH channel fixes newer than age's original minimum dependency.
+
+The engine communicates through a bounded JSON-lines protocol over private pipes. Passphrases, pasted identities, and plugin answers are not command arguments or environment variables. The engine's debug-transcript environment switch is removed. No server or background service is installed. Plugins are started only for user-selected recipients/identities/plugin names, never simply because an input header names a stanza type.
+
+Rust creates a staging file beside the destination before calling the engine. Private output has Unix mode 0600 or a protected owner/SYSTEM DACL on Windows. Authentication, stream finalization, process success, and disk flush must succeed before the staged file is committed. Without explicit replacement the commit cannot clobber an existing destination. With replacement enabled, input/key-file aliases are rejected and unsuccessful operations preserve the previous destination. Earlier completed files in a batch remain saved if a later file fails or the operation is cancelled.
+
+On Windows each operation runs in a private Job Object: cancellation and cleanup control only its owned engine and plugin descendants. Native Linux/macOS runtime and descendant-process qualification remain separate work. No process-name or global termination commands are used.
+
+Secrets are cleared where the Rust application controls their storage; GUI libraries, the Go runtime, clipboard, and operating system can retain copies. Temporary-file deletion is not secure erasure, and crashes/forced termination can leave staging files. Keep secret identities in a protected location with a backup.
+
+## Scope and evidence
+
+This is an independent desktop application, not an official age release or an independently audited encryption product. Windows is locally tested. Hardware-token protocol interactions are implemented, but a physical token was not certified. Arbitrary plugin-specific setup commands and shell pipelines are not part of the GUI.
+
+Normal launches write no diagnostic files. The explicit `--probe <directory>` option records a screenshot, renderer information, first-redraw timing, and exits. Benchmark results are fresh-process measurements; OS/driver caches are not flushed. The previous 0.1.0 measurements are retained in [historical validation](docs/validation-0.1.0.md).
+
+Application source is BSD-3-Clause licensed. Dependencies and bundled fonts/icons retain their own licenses; notices are included in the portable package. [Library selection](docs/library-selection.md) documents the native GUI choice.
