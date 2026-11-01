@@ -76,4 +76,4 @@ cargo build --release --locked
 
 `--probe <directory>` is an explicit diagnostic option: it records a screenshot, the selected renderer, startup timing, and then closes. Normal launches do not write diagnostic files. Probe timing begins at Rust `main` and records the first redraw event; the script also measures process launch to observation of that event. It does not flush OS disk caches and must not be presented as a cold-disk benchmark.
 
-The package script collects dependency license files and font/icon notices alongside the executable. Source is MIT licensed.
+The package script collects dependency license files and font/icon notices alongside the executable. Application source is BSD-3-Clause licensed; dependencies retain their own licenses.
