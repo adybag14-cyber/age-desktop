@@ -1,0 +1,6 @@
+/target/
+/dist/
+/evidence/
+*.age
+*.agekey
+/*.zip

@@ -1,0 +1,39 @@
+[package]
+name = "age-desktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A native Rust desktop companion for age encryption"
+license = "MIT"
+default-run = "age-desktop"
+
+[dependencies]
+# Patched classic-format line, released alongside 0.12.1. Avoid pulling the
+# unused P-256/HPKE and SSH/RSA stacks into an X25519/passphrase application.
+age = { version = "=0.11.5", default-features = false, features = ["armor"] }
+iced = { version = "=0.14.0", features = ["tokio", "advanced", "svg", "sysinfo"] }
+shadcn-iced = "=0.3.0"
+rfd = "0.15"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tempfile = "3"
+zeroize = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[[bin]]
+name = "age-desktop"
+path = "src/main.rs"
